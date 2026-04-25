@@ -87,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
                 repl: repl.clone(),
                 raft: None,
                 cluster: None,
+                health: None,
                 is_replica_replay: true,
             };
             for frame in frames {
@@ -123,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
                     repl,
                     raft: None,
                     cluster: None,
+                    health: None,
                     is_replica_replay: true,
                 };
                 commands::execute(frame, &ctx).await
@@ -134,8 +136,8 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Phase-6: cluster sharding.
-    let cluster = if let (Some(nodes_str), Some(self_addr)) =
+    // Phase-6: cluster sharding + Phase-8: health table.
+    let (cluster, health, cluster_self) = if let (Some(nodes_str), Some(self_addr)) =
         (&args.cluster_nodes, &args.cluster_self)
     {
         let nodes: Vec<String> = nodes_str
@@ -145,17 +147,21 @@ async fn main() -> anyhow::Result<()> {
             .map(String::from)
             .collect();
 
-        let cfg = cluster::ClusterConfig::new(nodes, self_addr)?;
+        let cfg = cluster::ClusterConfig::new(nodes.clone(), self_addr)?;
         let ranges = cfg.slot_ranges_for(cfg.my_index);
         info!(
             "Cluster mode: node {} owns slots {:?}",
             self_addr, ranges
         );
-        Some(Arc::new(tokio::sync::RwLock::new(
+
+        let peers: Vec<String> = nodes.iter().filter(|a| *a != self_addr).cloned().collect();
+        let health = cluster::HealthTable::new(&peers);
+        let shared_cluster = Arc::new(tokio::sync::RwLock::new(
             cluster::ClusterState { config: cfg },
-        )))
+        ));
+        (Some(shared_cluster), Some(health), Some(self_addr.clone()))
     } else {
-        None
+        (None, None, None)
     };
 
     // Phase-4 follower loop (only without Raft).
@@ -170,6 +176,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let server = network::Server::new(store, aof, repl, raft, cluster);
+    let server = network::Server::new(store, aof, repl, raft, cluster, health, cluster_self);
     server.run(&format!("{}:{}", args.host, args.port)).await
 }

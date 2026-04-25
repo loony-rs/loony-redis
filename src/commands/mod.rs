@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 
-use crate::cluster::{command_slot, CommandSlot, SharedCluster};
+use crate::cluster::{command_slot, CommandSlot, NodeState, SharedCluster, SharedHealth};
 use crate::consensus::Raft;
 use crate::persistence::Aof;
 use crate::protocol::{serialize_frame, Frame};
@@ -16,6 +16,8 @@ pub struct CommandContext {
     pub raft: Option<Arc<Raft>>,
     /// Cluster config, present when slot-based sharding is active.
     pub cluster: Option<SharedCluster>,
+    /// Node health table, present when cluster heartbeat is active.
+    pub health: Option<SharedHealth>,
     /// True when replaying commands received from the leader or from the Raft
     /// log. Skips READONLY checks and suppresses re-broadcasting/re-logging.
     pub is_replica_replay: bool,
@@ -909,6 +911,48 @@ async fn cmd_cluster(args: &[Frame], ctx: &CommandContext) -> Frame {
             }
         }
         "RESET" => Frame::ok(),
+
+        // ── CLUSTER HEALTH — operator view of peer liveness ───────────────
+        "HEALTH" => {
+            match &ctx.health {
+                None => Frame::bulk_str("cluster health monitoring not enabled"),
+                Some(ht) => {
+                    let mut rows = ht.snapshot().await;
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let body = rows.iter()
+                        .map(|(addr, state)| format!("{addr} {}", state.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\r\n");
+                    Frame::bulk_str(body)
+                }
+            }
+        }
+
+        // ── CLUSTER GOSSIP health-csv — internal peer health update ────────
+        "GOSSIP" => {
+            let payload = match bulk_as_str(args, 2) {
+                Some(p) => p,
+                None => return wrong_num_args("cluster|gossip"),
+            };
+            if let Some(ht) = &ctx.health {
+                let updates: Vec<(String, NodeState)> = payload
+                    .split(',')
+                    .filter_map(|part| {
+                        let mut it = part.splitn(2, '=');
+                        let addr = it.next()?.trim().to_string();
+                        let state = match it.next()?.trim() {
+                            "alive"     => NodeState::Alive,
+                            "suspected" => NodeState::Suspected,
+                            "failed"    => NodeState::Failed,
+                            _           => return None,
+                        };
+                        Some((addr, state))
+                    })
+                    .collect();
+                ht.apply_gossip(&updates).await;
+            }
+            Frame::ok()
+        }
 
         // ── CLUSTER MEET host port — add a node and rebalance ─────────────
         "MEET" => {

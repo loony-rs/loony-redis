@@ -299,3 +299,8 @@ echo "zz slot: $(redis-cli -p 6479 CLUSTER KEYSLOT zz)"
 redis-cli -p 6481 GET zz
 echo "testkey slot: $(redis-cli -p 6479 CLUSTER KEYSLOT testkey)"
 redis-cli -p 6479 CLUSTER KEYSLOT testkey
+
+# ============================================================================================================================================
+
+grep -n "^// ── Tests\|^#\[cfg(test)\]" /home/sankar/ai_projects/loony-redis/src/cluster/mod.rs
+

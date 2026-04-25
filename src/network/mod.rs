@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
-use crate::cluster::SharedCluster;
+use crate::cluster::{run_heartbeat_task, SharedCluster, SharedHealth};
 use crate::commands::{execute, CommandContext};
 use crate::consensus::Raft;
 use crate::persistence::Aof;
@@ -19,6 +19,8 @@ pub struct Server {
     repl: Arc<Replication>,
     raft: Option<Arc<Raft>>,
     cluster: Option<SharedCluster>,
+    health: Option<SharedHealth>,
+    my_addr: Option<String>,
 }
 
 impl Server {
@@ -28,8 +30,10 @@ impl Server {
         repl: Arc<Replication>,
         raft: Option<Arc<Raft>>,
         cluster: Option<SharedCluster>,
+        health: Option<SharedHealth>,
+        my_addr: Option<String>,
     ) -> Self {
-        Server { store, aof, repl, raft, cluster }
+        Server { store, aof, repl, raft, cluster, health, my_addr }
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -41,6 +45,12 @@ impl Server {
         let repl = self.repl;
         let raft = self.raft;
         let cluster = self.cluster;
+        let health = self.health;
+
+        // Spawn heartbeat task when cluster + health are both active.
+        if let (Some(c), Some(h), Some(my)) = (cluster.clone(), health.clone(), self.my_addr) {
+            tokio::spawn(run_heartbeat_task(my, c, h));
+        }
 
         loop {
             let (socket, peer) = listener.accept().await?;
@@ -51,6 +61,7 @@ impl Server {
             let repl = repl.clone();
             let raft = raft.clone();
             let cluster = cluster.clone();
+            let health = health.clone();
 
             tokio::spawn(async move {
                 let ctx = CommandContext {
@@ -59,6 +70,7 @@ impl Server {
                     repl: repl.clone(),
                     raft: raft.clone(),
                     cluster: cluster.clone(),
+                    health,
                     is_replica_replay: false,
                 };
                 if let Err(e) = handle_connection(socket, ctx, store, repl).await {
@@ -213,7 +225,8 @@ async fn replicate_from_leader(
                         aof: None,
                         repl: repl.clone(),
                         raft: None,
-                        cluster: None, // replicas don't reroute
+                        cluster: None,
+                        health: None,
                         is_replica_replay: true,
                     };
                     execute(frame, &ctx).await;

@@ -538,6 +538,260 @@ pub async fn proxy_to(node_addr: &str, frame: Frame) -> Frame {
 
 // (SharedCluster is defined above with ClusterState)
 
+// ── Phase 8: Fault detection & gossip ─────────────────────────────────────
+
+const HEARTBEAT_INTERVAL_MS: u64 = 500;
+const HEARTBEAT_TIMEOUT_MS:  u64 = 200;
+/// Consecutive misses before a peer is declared Failed.
+const FAIL_THRESHOLD: u32 = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeState {
+    Alive,
+    Suspected,
+    Failed,
+}
+
+impl NodeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            NodeState::Alive     => "alive",
+            NodeState::Suspected => "suspected",
+            NodeState::Failed    => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeHealth {
+    pub state:     NodeState,
+    pub missed:    u32,
+    pub last_seen: std::time::SystemTime,
+}
+
+pub struct HealthTable {
+    inner: tokio::sync::RwLock<HashMap<String, NodeHealth>>,
+}
+
+pub type SharedHealth = Arc<HealthTable>;
+
+impl HealthTable {
+    /// Create a health table pre-populated with `peers` (all Alive).
+    pub fn new(peers: &[String]) -> SharedHealth {
+        let mut map = HashMap::new();
+        for peer in peers {
+            map.insert(peer.clone(), NodeHealth {
+                state:     NodeState::Alive,
+                missed:    0,
+                last_seen: std::time::SystemTime::now(),
+            });
+        }
+        Arc::new(HealthTable { inner: tokio::sync::RwLock::new(map) })
+    }
+
+    pub async fn mark_alive(&self, addr: &str) {
+        let mut t = self.inner.write().await;
+        let h = t.entry(addr.to_string()).or_insert_with(default_health);
+        h.state     = NodeState::Alive;
+        h.missed    = 0;
+        h.last_seen = std::time::SystemTime::now();
+    }
+
+    /// Increment miss counter; returns the resulting state.
+    pub async fn record_miss(&self, addr: &str) -> NodeState {
+        let mut t = self.inner.write().await;
+        let h = t.entry(addr.to_string()).or_insert_with(default_health);
+        h.missed += 1;
+        h.state = if h.missed >= FAIL_THRESHOLD {
+            NodeState::Failed
+        } else {
+            NodeState::Suspected
+        };
+        h.state.clone()
+    }
+
+    pub async fn is_failed(&self, addr: &str) -> bool {
+        let t = self.inner.read().await;
+        matches!(t.get(addr), Some(h) if h.state == NodeState::Failed)
+    }
+
+    /// Ensure all `addrs` appear in the table (adds missing ones as Alive).
+    pub async fn sync_nodes(&self, addrs: &[String]) {
+        let mut t = self.inner.write().await;
+        for addr in addrs {
+            t.entry(addr.clone()).or_insert_with(default_health);
+        }
+        // Drop entries no longer in the node list (departed nodes).
+        t.retain(|a, _| addrs.contains(a));
+    }
+
+    /// Apply gossip from a peer — only ever move state toward worse (not back to Alive).
+    pub async fn apply_gossip(&self, updates: &[(String, NodeState)]) {
+        let mut t = self.inner.write().await;
+        for (addr, state) in updates {
+            let h = t.entry(addr.clone()).or_insert_with(default_health);
+            let worse = match (&h.state, state) {
+                (NodeState::Alive,     NodeState::Suspected) => true,
+                (NodeState::Alive,     NodeState::Failed)    => true,
+                (NodeState::Suspected, NodeState::Failed)    => true,
+                _ => false,
+            };
+            if worse {
+                h.state = state.clone();
+            }
+        }
+    }
+
+    /// Serialize for `CLUSTER GOSSIP` payload.
+    pub async fn to_csv(&self) -> String {
+        let t = self.inner.read().await;
+        t.iter()
+            .map(|(addr, h)| format!("{addr}={}", h.state.as_str()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// For `CLUSTER HEALTH` display.
+    pub async fn snapshot(&self) -> Vec<(String, NodeState)> {
+        let t = self.inner.read().await;
+        t.iter().map(|(a, h)| (a.clone(), h.state.clone())).collect()
+    }
+}
+
+fn default_health() -> NodeHealth {
+    NodeHealth {
+        state:     NodeState::Alive,
+        missed:    0,
+        last_seen: std::time::SystemTime::now(),
+    }
+}
+
+// ── Heartbeat + auto-heal ──────────────────────────────────────────────────
+
+/// Spawn this as a tokio task for each cluster node.
+pub async fn run_heartbeat_task(
+    my_addr: String,
+    cluster: SharedCluster,
+    health: SharedHealth,
+) {
+    let interval = std::time::Duration::from_millis(HEARTBEAT_INTERVAL_MS);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let peers: Vec<String> = cluster.read().await.config.nodes.clone();
+
+        // Keep health table in sync with cluster membership.
+        health.sync_nodes(&peers).await;
+
+        for peer in &peers {
+            if *peer == my_addr { continue; }
+            if health.is_failed(peer).await { continue; }
+
+            if try_ping(peer).await {
+                health.mark_alive(peer).await;
+                // Piggyback gossip on a successful heartbeat.
+                let csv = health.to_csv().await;
+                let f = Frame::Array(Some(vec![
+                    Frame::bulk_str("CLUSTER"),
+                    Frame::bulk_str("GOSSIP"),
+                    Frame::bulk_str(csv),
+                ]));
+                // Fire-and-forget — gossip failure is harmless.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(HEARTBEAT_TIMEOUT_MS),
+                    send_internal(peer, f),
+                )
+                .await;
+            } else {
+                let state = health.record_miss(peer).await;
+                if state == NodeState::Suspected {
+                    warn!("Peer {peer} heartbeat missed (suspected)");
+                } else if state == NodeState::Failed {
+                    warn!("Peer {peer} failed ({FAIL_THRESHOLD} misses) — initiating auto-heal");
+                    auto_heal(peer, &my_addr, &cluster, &health).await;
+                }
+            }
+        }
+    }
+}
+
+async fn try_ping(addr: &str) -> bool {
+    let ping = Frame::Array(Some(vec![Frame::bulk_str("PING")]));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_millis(HEARTBEAT_TIMEOUT_MS),
+        async move {
+            let mut conn = TcpStream::connect(addr).await?;
+            conn.write_all(&serialize_frame(&ping)).await?;
+            let mut buf = BytesMut::with_capacity(64);
+            loop {
+                conn.read_buf(&mut buf).await?;
+                if let Ok(Some((resp, _))) = parse_frame(&buf) {
+                    return Ok::<Frame, anyhow::Error>(resp);
+                }
+            }
+        },
+    )
+    .await;
+    matches!(result, Ok(Ok(Frame::SimpleString(s))) if s == "PONG")
+}
+
+async fn auto_heal(
+    failed_addr: &str,
+    my_addr: &str,
+    cluster: &SharedCluster,
+    health: &SharedHealth,
+) {
+    let (old_nodes, new_nodes) = {
+        let state = cluster.read().await;
+        if !state.config.nodes.contains(&failed_addr.to_string()) {
+            return; // already removed
+        }
+        let old = state.config.nodes.clone();
+        let mut new_n = old.clone();
+        new_n.retain(|a| a != failed_addr);
+        (old, new_n)
+    };
+
+    if new_nodes.is_empty() {
+        warn!("auto_heal: {failed_addr} is the last node — cannot remove");
+        return;
+    }
+    if !new_nodes.contains(&my_addr.to_string()) {
+        return; // this node isn't surviving either
+    }
+
+    let nodes_csv = new_nodes.join(",");
+
+    // Update this node's routing first.
+    match ClusterConfig::new(new_nodes.clone(), my_addr) {
+        Ok(new_cfg) => { cluster.write().await.config = new_cfg; }
+        Err(e) => { warn!("auto_heal config build failed: {e}"); return; }
+    }
+
+    // Propagate updated routing to surviving peers.
+    for peer in &old_nodes {
+        if *peer == my_addr || *peer == failed_addr { continue; }
+        if health.is_failed(peer).await { continue; }
+        let f = Frame::Array(Some(vec![
+            Frame::bulk_str("CLUSTER"),
+            Frame::bulk_str("SYNC"),
+            Frame::bulk_str(&nodes_csv),
+        ]));
+        // Best-effort — surviving peers may not all be reachable.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            send_internal(peer, f),
+        )
+        .await;
+    }
+
+    let lost_slots = NUM_SLOTS as usize / old_nodes.len().max(1);
+    warn!(
+        "auto_heal complete: {failed_addr} removed, ~{lost_slots} slots redistributed \
+         (data on failed node is lost — add replicas for durability)"
+    );
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
