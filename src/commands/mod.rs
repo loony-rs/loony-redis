@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 
+use crate::consensus::Raft;
 use crate::persistence::Aof;
 use crate::protocol::{serialize_frame, Frame};
 use crate::replication::Replication;
@@ -10,8 +11,10 @@ pub struct CommandContext {
     pub store: Arc<Store>,
     pub aof: Option<Arc<Aof>>,
     pub repl: Arc<Replication>,
-    /// True when replaying commands received from the leader; skips READONLY
-    /// checks and avoids re-broadcasting back to replicas.
+    /// Raft handle, present when consensus-based replication is active.
+    pub raft: Option<Arc<Raft>>,
+    /// True when replaying commands received from the leader or from the Raft
+    /// log. Skips READONLY checks and suppresses re-broadcasting/re-logging.
     pub is_replica_replay: bool,
 }
 
@@ -45,6 +48,20 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
     };
     let cmd_str = String::from_utf8_lossy(&cmd).to_uppercase();
 
+    // ── Raft path: route writes through consensus ─────────────────────────
+    if is_write(&cmd_str) && !ctx.is_replica_replay {
+        if let Some(raft) = &ctx.raft {
+            if !raft.is_leader.load(std::sync::atomic::Ordering::Acquire) {
+                let leader = raft.current_leader().await.unwrap_or_default();
+                return Frame::error(format!("MOVED {leader}"));
+            }
+            // Serialise the command and submit to Raft.
+            let cmd_bytes = serialize_frame(&Frame::Array(Some(args)));
+            return raft.propose(cmd_bytes).await;
+        }
+    }
+
+    // ── Phase-4 replication path ──────────────────────────────────────────
     // Reject writes on replicas (unless we're in the replay path).
     if is_write(&cmd_str) && !ctx.is_replica_replay && !ctx.repl.is_leader {
         return Frame::error(
@@ -55,10 +72,9 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
     let response = dispatch(&cmd_str, &args, ctx).await;
 
     // Broadcast successful writes to connected replicas.
-    if is_write(&cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader {
+    if is_write(&cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader && ctx.raft.is_none() {
         if !matches!(&response, Frame::Error(_)) {
-            let cmd_bytes =
-                serialize_frame(&Frame::Array(Some(args)));
+            let cmd_bytes = serialize_frame(&Frame::Array(Some(args)));
             ctx.repl.broadcast(cmd_bytes);
         }
     }

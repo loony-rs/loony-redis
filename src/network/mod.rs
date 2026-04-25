@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::commands::{execute, CommandContext};
+use crate::consensus::Raft;
 use crate::persistence::Aof;
 use crate::protocol::{parse_frame, serialize_frame, Frame};
 use crate::replication::{snapshot_entry_to_resp, Replication};
@@ -15,11 +16,17 @@ pub struct Server {
     store: Arc<Store>,
     aof: Option<Arc<Aof>>,
     repl: Arc<Replication>,
+    raft: Option<Arc<Raft>>,
 }
 
 impl Server {
-    pub fn new(store: Arc<Store>, aof: Option<Arc<Aof>>, repl: Arc<Replication>) -> Self {
-        Server { store, aof, repl }
+    pub fn new(
+        store: Arc<Store>,
+        aof: Option<Arc<Aof>>,
+        repl: Arc<Replication>,
+        raft: Option<Arc<Raft>>,
+    ) -> Self {
+        Server { store, aof, repl, raft }
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -29,6 +36,7 @@ impl Server {
         let store = self.store;
         let aof = self.aof;
         let repl = self.repl;
+        let raft = self.raft;
 
         loop {
             let (socket, peer) = listener.accept().await?;
@@ -37,12 +45,14 @@ impl Server {
             let store = store.clone();
             let aof = aof.clone();
             let repl = repl.clone();
+            let raft = raft.clone();
 
             tokio::spawn(async move {
                 let ctx = CommandContext {
                     store: store.clone(),
                     aof,
                     repl: repl.clone(),
+                    raft: raft.clone(),
                     is_replica_replay: false,
                 };
                 if let Err(e) = handle_connection(socket, ctx, store, repl).await {
@@ -194,8 +204,9 @@ async fn replicate_from_leader(
                     let _ = buf.split_to(consumed);
                     let ctx = CommandContext {
                         store: store.clone(),
-                        aof: None,         // don't double-log during replay
+                        aof: None,
                         repl: repl.clone(),
+                        raft: None,
                         is_replica_replay: true,
                     };
                     execute(frame, &ctx).await;
