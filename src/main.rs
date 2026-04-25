@@ -2,6 +2,7 @@ mod commands;
 mod network;
 mod persistence;
 mod protocol;
+mod replication;
 mod storage;
 
 use std::sync::Arc;
@@ -24,6 +25,11 @@ struct Args {
     /// Path to Append-Only File for persistence (omit to disable)
     #[arg(long)]
     aof: Option<String>,
+
+    /// Replicate from this leader address, e.g. 127.0.0.1:6379
+    /// When set, this node starts as a read-only replica.
+    #[arg(long)]
+    replicaof: Option<String>,
 }
 
 #[tokio::main]
@@ -38,14 +44,24 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(storage::Store::new());
 
+    // Build replication state based on role.
+    let repl = if let Some(ref leader) = args.replicaof {
+        info!("Starting as replica of {leader}");
+        Arc::new(replication::Replication::new_follower(leader.clone()))
+    } else {
+        Arc::new(replication::Replication::new_leader())
+    };
+
     // Replay AOF before accepting connections.
     let aof = if let Some(ref path) = args.aof {
         let frames = persistence::load_frames(path).await?;
         if !frames.is_empty() {
-            info!("replaying {} AOF commands", frames.len());
+            info!("Replaying {} AOF commands", frames.len());
             let replay_ctx = commands::CommandContext {
                 store: store.clone(),
-                aof: None, // no re-logging during replay
+                aof: None,
+                repl: repl.clone(),
+                is_replica_replay: true, // skip READONLY / broadcast during replay
             };
             for frame in frames {
                 commands::execute(frame, &replay_ctx).await;
@@ -56,6 +72,16 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let server = network::Server::new(store, aof);
+    // If this is a replica, start the background replication loop.
+    if let Some(ref leader) = args.replicaof {
+        let leader = leader.clone();
+        let store2 = store.clone();
+        let repl2 = repl.clone();
+        tokio::spawn(async move {
+            network::run_follower_loop(leader, store2, repl2).await;
+        });
+    }
+
+    let server = network::Server::new(store, aof, repl);
     server.run(&format!("{}:{}", args.host, args.port)).await
 }

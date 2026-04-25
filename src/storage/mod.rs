@@ -11,6 +11,14 @@ pub enum Value {
     Set(HashSet<Bytes>),
 }
 
+/// A snapshot of a single key's data — used for full-sync replication.
+pub enum SnapshotEntry {
+    String { key: String, value: Bytes },
+    List { key: String, items: Vec<Bytes> },
+    Hash { key: String, fields: Vec<(Bytes, Bytes)> },
+    Set { key: String, members: Vec<Bytes> },
+}
+
 #[derive(Debug)]
 struct Entry {
     value: Value,
@@ -138,6 +146,37 @@ impl Store {
 
     pub fn flush(&self) {
         self.data.clear();
+    }
+
+    /// Return a point-in-time snapshot of all non-expired entries, suitable
+    /// for sending to a new replica during initial full-sync.
+    pub fn snapshot(&self) -> Vec<SnapshotEntry> {
+        self.data
+            .iter()
+            .filter(|e| !e.value().is_expired())
+            .filter_map(|e| {
+                let key = e.key().clone();
+                match &e.value().value {
+                    Value::String(b) => Some(SnapshotEntry::String {
+                        key,
+                        value: b.clone(),
+                    }),
+                    Value::List(list) if !list.is_empty() => Some(SnapshotEntry::List {
+                        key,
+                        items: list.iter().cloned().collect(),
+                    }),
+                    Value::Hash(map) if !map.is_empty() => Some(SnapshotEntry::Hash {
+                        key,
+                        fields: map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    }),
+                    Value::Set(set) if !set.is_empty() => Some(SnapshotEntry::Set {
+                        key,
+                        members: set.iter().cloned().collect(),
+                    }),
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     // ── String operations ──────────────────────────────────────────────────

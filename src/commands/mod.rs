@@ -2,12 +2,33 @@ use bytes::Bytes;
 use std::sync::Arc;
 
 use crate::persistence::Aof;
-use crate::protocol::Frame;
+use crate::protocol::{serialize_frame, Frame};
+use crate::replication::Replication;
 use crate::storage::{Store, Value};
 
 pub struct CommandContext {
     pub store: Arc<Store>,
     pub aof: Option<Arc<Aof>>,
+    pub repl: Arc<Replication>,
+    /// True when replaying commands received from the leader; skips READONLY
+    /// checks and avoids re-broadcasting back to replicas.
+    pub is_replica_replay: bool,
+}
+
+/// Commands that mutate state. Used for READONLY enforcement and replication.
+static WRITE_COMMANDS: &[&str] = &[
+    "SET", "MSET", "SETNX", "GETSET", "APPEND",
+    "INCR", "INCRBY", "DECR", "DECRBY",
+    "DEL",
+    "LPUSH", "RPUSH", "LPOP", "RPOP",
+    "HSET", "HMSET", "HDEL",
+    "SADD", "SREM",
+    "EXPIRE", "PEXPIRE", "PERSIST",
+    "FLUSHDB", "FLUSHALL",
+];
+
+fn is_write(cmd: &str) -> bool {
+    WRITE_COMMANDS.contains(&cmd)
 }
 
 /// Dispatch a decoded frame as a command and return the response frame.
@@ -24,7 +45,29 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
     };
     let cmd_str = String::from_utf8_lossy(&cmd).to_uppercase();
 
-    match cmd_str.as_str() {
+    // Reject writes on replicas (unless we're in the replay path).
+    if is_write(&cmd_str) && !ctx.is_replica_replay && !ctx.repl.is_leader {
+        return Frame::error(
+            "READONLY You can't write against a read only replica.",
+        );
+    }
+
+    let response = dispatch(&cmd_str, &args, ctx).await;
+
+    // Broadcast successful writes to connected replicas.
+    if is_write(&cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader {
+        if !matches!(&response, Frame::Error(_)) {
+            let cmd_bytes =
+                serialize_frame(&Frame::Array(Some(args)));
+            ctx.repl.broadcast(cmd_bytes);
+        }
+    }
+
+    response
+}
+
+async fn dispatch(cmd_str: &str, args: &[Frame], ctx: &CommandContext) -> Frame {
+    match cmd_str {
         // ── Connection ────────────────────────────────────────────────────
         "PING" => cmd_ping(&args),
         "ECHO" => cmd_echo(&args),
