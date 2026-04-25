@@ -151,7 +151,9 @@ async fn main() -> anyhow::Result<()> {
             "Cluster mode: node {} owns slots {:?}",
             self_addr, ranges
         );
-        Some(Arc::new(cfg))
+        Some(Arc::new(tokio::sync::RwLock::new(
+            cluster::ClusterState { config: cfg },
+        )))
     } else {
         None
     };

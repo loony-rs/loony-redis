@@ -69,18 +69,23 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
         if let Some(cluster) = &ctx.cluster {
             // CLUSTER subcommands are always handled locally.
             if cmd_str != "CLUSTER" {
-                match command_slot(&cmd_str, &args) {
-                    CommandSlot::CrossSlot => {
-                        return Frame::error(
-                            "CROSSSLOT Keys in request don't hash to the same slot",
-                        );
+                // Acquire read lock, compute routing decision, release before I/O.
+                let routing = {
+                    let state = cluster.read().await;
+                    match command_slot(&cmd_str, &args) {
+                        CommandSlot::CrossSlot => Some(Err("CROSSSLOT Keys in request don't hash to the same slot")),
+                        CommandSlot::Slot(slot) if !state.config.is_mine(slot) => {
+                            Some(Ok(state.config.node_for_slot(slot).to_string()))
+                        }
+                        _ => None,
                     }
-                    CommandSlot::Slot(slot) if !cluster.is_mine(slot) => {
-                        let target = cluster.node_for_slot(slot).to_string();
-                        let original_frame = Frame::Array(Some(args));
-                        return crate::cluster::proxy_to(&target, original_frame).await;
+                };
+                match routing {
+                    Some(Err(e)) => return Frame::error(e),
+                    Some(Ok(target)) => {
+                        return crate::cluster::proxy_to(&target, Frame::Array(Some(args))).await;
                     }
-                    _ => {} // mine or no-key command — fall through
+                    None => {}
                 }
             }
         }
@@ -117,7 +122,8 @@ async fn dispatch(cmd_str: &str, args: &[Frame], ctx: &CommandContext) -> Frame 
         "CLIENT" => Frame::ok(),
         "COMMAND" => Frame::empty_array(),
         "CONFIG" => Frame::empty_array(),
-        "CLUSTER" => cmd_cluster(&args, ctx),
+        "CLUSTER" => cmd_cluster(&args, ctx).await,
+        "MIGRATE" => cmd_migrate(&args, ctx).await,
 
         // ── Keyspace ──────────────────────────────────────────────────────
         "DEL" => cmd_del(&args, ctx).await,
@@ -855,36 +861,42 @@ fn cmd_scard(args: &[Frame], ctx: &CommandContext) -> Frame {
 
 // ── CLUSTER commands ───────────────────────────────────────────────────────
 
-fn cmd_cluster(args: &[Frame], ctx: &CommandContext) -> Frame {
+async fn cmd_cluster(args: &[Frame], ctx: &CommandContext) -> Frame {
+    use crate::cluster::{
+        drain_slots, push_entries_to, send_internal, slot_for_key, ClusterConfig,
+    };
+    use tracing::info;
+
     let sub = bulk_as_str(args, 1)
         .map(|s| s.to_uppercase())
         .unwrap_or_default();
 
     match sub.as_str() {
+        // ── Read-only info commands ───────────────────────────────────────
         "INFO" => {
             let body = match &ctx.cluster {
-                Some(c) => c.cluster_info(),
+                Some(c) => c.read().await.config.cluster_info(),
                 None => "cluster_enabled:0\r\ncluster_state:ok\r\n".to_string(),
             };
             Frame::bulk_str(body)
         }
         "NODES" => {
             let body = match &ctx.cluster {
-                Some(c) => c.cluster_nodes_text(),
+                Some(c) => c.read().await.config.cluster_nodes_text(),
                 None => String::new(),
             };
             Frame::bulk_str(body)
         }
         "SLOTS" => match &ctx.cluster {
-            Some(c) => c.cluster_slots_frame(),
+            Some(c) => c.read().await.config.cluster_slots_frame(),
             None => Frame::empty_array(),
         },
         "SHARDS" => match &ctx.cluster {
-            Some(c) => c.cluster_shards_frame(),
+            Some(c) => c.read().await.config.cluster_shards_frame(),
             None => Frame::empty_array(),
         },
         "MYID" => match &ctx.cluster {
-            Some(c) => Frame::bulk_str(crate::cluster::node_id_of(c.my_addr())),
+            Some(c) => Frame::bulk_str(crate::cluster::node_id_of(c.read().await.config.my_addr())),
             None => Frame::bulk_str(""),
         },
         "KEYSLOT" => {
@@ -892,11 +904,300 @@ fn cmd_cluster(args: &[Frame], ctx: &CommandContext) -> Frame {
                 return wrong_num_args("cluster|keyslot");
             }
             match bulk_bytes(args, 2) {
-                Some(k) => Frame::integer(crate::cluster::slot_for_key(&k) as i64),
+                Some(k) => Frame::integer(slot_for_key(&k) as i64),
                 None => wrong_num_args("cluster|keyslot"),
             }
         }
         "RESET" => Frame::ok(),
+
+        // ── CLUSTER MEET host port — add a node and rebalance ─────────────
+        "MEET" => {
+            if args.len() < 4 {
+                return wrong_num_args("cluster|meet");
+            }
+            let host = match bulk_as_str(args, 2) {
+                Some(h) => h,
+                None => return wrong_num_args("cluster|meet"),
+            };
+            let port = match bulk_as_str(args, 3).and_then(|s| s.parse::<u16>().ok()) {
+                Some(p) => p,
+                None => return Frame::error("ERR invalid port"),
+            };
+            let new_addr = format!("{host}:{port}");
+
+            let cluster = match &ctx.cluster {
+                Some(c) => c,
+                None => return Frame::error("ERR cluster mode not enabled"),
+            };
+
+            // Snapshot old state.
+            let (old_nodes, my_addr) = {
+                let state = cluster.read().await;
+                if state.config.nodes.contains(&new_addr) {
+                    return Frame::error("ERR node already in cluster");
+                }
+                (state.config.nodes.clone(), state.config.my_addr().to_string())
+            };
+
+            // Compute the new sorted node list — same algorithm every node uses.
+            let mut new_nodes = old_nodes.clone();
+            new_nodes.push(new_addr.clone());
+            new_nodes.sort();
+            new_nodes.dedup();
+            let nodes_csv = new_nodes.join(",");
+
+            // Tell new node about the full cluster first so it can accept data.
+            let sync_frame = Frame::Array(Some(vec![
+                Frame::bulk_str("CLUSTER"),
+                Frame::bulk_str("SYNC"),
+                Frame::bulk_str(&nodes_csv),
+            ]));
+            send_internal(&new_addr, sync_frame).await;
+
+            // Tell all existing peers (triggers their own migrations).
+            for peer in &old_nodes {
+                if *peer != my_addr {
+                    let f = Frame::Array(Some(vec![
+                        Frame::bulk_str("CLUSTER"),
+                        Frame::bulk_str("SYNC"),
+                        Frame::bulk_str(&nodes_csv),
+                    ]));
+                    send_internal(peer, f).await;
+                }
+            }
+
+            // Perform this node's own migrations.
+            let old_cfg = ClusterConfig::new(old_nodes, &my_addr).unwrap();
+            let new_cfg = ClusterConfig::new(new_nodes, &my_addr).unwrap();
+            let to_send = old_cfg.slots_to_send(&new_cfg);
+            let mut migrated = 0usize;
+            for (target, slots) in to_send {
+                let entries = drain_slots(&slots, &ctx.store);
+                let n = entries.len();
+                push_entries_to(&target, entries).await;
+                migrated += n;
+            }
+            if migrated > 0 {
+                info!("MEET {new_addr}: migrated {migrated} keys outbound");
+            }
+
+            // Commit new config locally.
+            cluster.write().await.config = new_cfg;
+            Frame::ok()
+        }
+
+        // ── CLUSTER FORGET node-id — gracefully remove a node ────────────
+        "FORGET" => {
+            if args.len() < 3 {
+                return wrong_num_args("cluster|forget");
+            }
+            let node_id_arg = match bulk_as_str(args, 2) {
+                Some(s) => s,
+                None => return wrong_num_args("cluster|forget"),
+            };
+
+            let cluster = match &ctx.cluster {
+                Some(c) => c,
+                None => return Frame::error("ERR cluster mode not enabled"),
+            };
+
+            // Resolve node-id → address.
+            let (leaving_addr, old_nodes, my_addr) = {
+                let state = cluster.read().await;
+                let found = state.config.nodes.iter().find(|a| {
+                    crate::cluster::node_id_of(a) == node_id_arg || **a == node_id_arg
+                });
+                match found {
+                    None => return Frame::error(format!("ERR unknown node id `{node_id_arg}`")),
+                    Some(a) => {
+                        if *a == state.config.my_addr() {
+                            return Frame::error("ERR cannot FORGET self");
+                        }
+                        (a.clone(), state.config.nodes.clone(), state.config.my_addr().to_string())
+                    }
+                }
+            };
+
+            let mut new_nodes = old_nodes.clone();
+            new_nodes.retain(|a| *a != leaving_addr);
+            let nodes_csv = new_nodes.join(",");
+
+            let new_cfg = ClusterConfig::new(new_nodes.clone(), &my_addr).unwrap();
+
+            // Step 1: Update this node's routing FIRST so it can accept incoming keys.
+            cluster.write().await.config = new_cfg;
+
+            // Step 2: Update all remaining peers — they must have correct routing
+            //         before the departing node pushes keys to them.
+            for peer in &old_nodes {
+                if *peer != my_addr && *peer != leaving_addr {
+                    let f = Frame::Array(Some(vec![
+                        Frame::bulk_str("CLUSTER"),
+                        Frame::bulk_str("SYNC"),
+                        Frame::bulk_str(&nodes_csv),
+                    ]));
+                    send_internal(peer, f).await;
+                }
+            }
+
+            // Step 3: DRAIN the departing node (all receivers now have correct routing).
+            let drain_frame = Frame::Array(Some(vec![
+                Frame::bulk_str("CLUSTER"),
+                Frame::bulk_str("DRAIN"),
+                Frame::bulk_str(&nodes_csv),
+            ]));
+            let drain_resp = send_internal(&leaving_addr, drain_frame).await;
+            if let Frame::Error(e) = &drain_resp {
+                return Frame::error(format!("ERR DRAIN failed: {e}"));
+            }
+
+            info!("FORGET {leaving_addr}: cluster shrunk to {} nodes", new_nodes.len());
+            Frame::ok()
+        }
+
+        // ── CLUSTER SYNC node-list — internal: peer says membership changed ─
+        "SYNC" => {
+            let nodes_csv = match bulk_as_str(args, 2) {
+                Some(s) => s,
+                None => return wrong_num_args("cluster|sync"),
+            };
+            let new_nodes: Vec<String> = nodes_csv
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+
+            let cluster = match &ctx.cluster {
+                Some(c) => c,
+                None => return Frame::error("ERR cluster mode not enabled"),
+            };
+
+            let (old_nodes, my_addr) = {
+                let state = cluster.read().await;
+                (state.config.nodes.clone(), state.config.my_addr().to_string())
+            };
+
+            if !new_nodes.contains(&my_addr) {
+                return Frame::error("ERR this node is not in the new node list");
+            }
+
+            let old_cfg = ClusterConfig::new(old_nodes, &my_addr).unwrap();
+            let new_cfg = ClusterConfig::new(new_nodes, &my_addr).unwrap();
+
+            // Migrate outbound slots.
+            let to_send = old_cfg.slots_to_send(&new_cfg);
+            let mut migrated = 0usize;
+            for (target, slots) in to_send {
+                let entries = drain_slots(&slots, &ctx.store);
+                let n = entries.len();
+                push_entries_to(&target, entries).await;
+                migrated += n;
+            }
+            if migrated > 0 {
+                info!("SYNC: migrated {migrated} keys outbound");
+            }
+
+            cluster.write().await.config = new_cfg;
+            Frame::ok()
+        }
+
+        // ── CLUSTER DRAIN new-node-list — internal: migrate all my slots ──
+        "DRAIN" => {
+            let nodes_csv = match bulk_as_str(args, 2) {
+                Some(s) => s,
+                None => return wrong_num_args("cluster|drain"),
+            };
+            let new_nodes: Vec<String> = nodes_csv
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+
+            let cluster = match &ctx.cluster {
+                Some(c) => c,
+                None => return Frame::error("ERR cluster mode not enabled"),
+            };
+
+            let (my_addr, all_slots) = {
+                let state = cluster.read().await;
+                (state.config.my_addr().to_string(), state.config.my_slots())
+            };
+
+            // Build a routing table for the new cluster to know where to send each key.
+            let new_routing = ClusterConfig::for_routing(new_nodes.clone());
+
+            // Group keys by new owner.
+            let mut by_target: std::collections::HashMap<String, Vec<u16>> =
+                std::collections::HashMap::new();
+            for slot in all_slots {
+                let owner = new_routing.node_for_slot(slot).to_string();
+                if owner != my_addr {
+                    by_target.entry(owner).or_default().push(slot);
+                }
+            }
+
+            let mut total = 0usize;
+            for (target, slots) in by_target {
+                let entries = drain_slots(&slots, &ctx.store);
+                let n = entries.len();
+                push_entries_to(&target, entries).await;
+                total += n;
+            }
+            if total > 0 {
+                info!("DRAIN: pushed {total} keys to new owners");
+            }
+
+            Frame::integer(total as i64)
+        }
+
         _ => Frame::error(format!("ERR unknown CLUSTER subcommand `{sub}`")),
+    }
+}
+
+// ── MIGRATE command ────────────────────────────────────────────────────────
+
+async fn cmd_migrate(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // MIGRATE host port key db timeout [COPY] [REPLACE]
+    if args.len() < 6 {
+        return wrong_num_args("migrate");
+    }
+    let host = match bulk_as_str(args, 1) {
+        Some(h) => h,
+        None => return wrong_num_args("migrate"),
+    };
+    let port = match bulk_as_str(args, 2).and_then(|s| s.parse::<u16>().ok()) {
+        Some(p) => p,
+        None => return Frame::error("ERR invalid port"),
+    };
+    let key = match bulk_as_str(args, 3) {
+        Some(k) => k,
+        None => return wrong_num_args("migrate"),
+    };
+    let copy = args[6..].iter().any(|f| {
+        matches!(f, Frame::Bulk(Some(b)) if b.to_ascii_uppercase() == b"COPY")
+    });
+
+    let target = format!("{host}:{port}");
+
+    let value = match ctx.store.get(&key) {
+        Some(v) => v,
+        None => return Frame::bulk_str("NOKEY"),
+    };
+    let pttl = ctx.store.pttl(&key);
+
+    let frame = crate::cluster::build_value_frame(&key, &value, pttl);
+    let resp = crate::cluster::send_internal(&target, frame).await;
+
+    match resp {
+        Frame::SimpleString(ref s) if s == "OK" => {
+            if !copy {
+                ctx.store.del(&[key]);
+            }
+            Frame::ok()
+        }
+        Frame::Error(e) => Frame::error(format!("ERR target: {e}")),
+        _ => Frame::error("ERR unexpected response from migration target"),
     }
 }

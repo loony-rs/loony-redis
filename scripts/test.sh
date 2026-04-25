@@ -215,3 +215,87 @@ sleep 1
 echo "PIDs: $PID0 $PID1 $PID2"
 echo "=== Node 0 log ==="
 cat /tmp/node0.log
+
+# ============================================================================================================================================
+
+kill $(lsof -ti:6479,6480,6481,6482) 2>/dev/null; sleep 0.3
+
+# Start 3-node cluster
+NODES3="127.0.0.1:6479,127.0.0.1:6480,127.0.0.1:6481"
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6479 --cluster-nodes "$NODES3" --cluster-self 127.0.0.1:6479 > /tmp/n0.log 2>&1 &
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6480 --cluster-nodes "$NODES3" --cluster-self 127.0.0.1:6480 > /tmp/n1.log 2>&1 &
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6481 --cluster-nodes "$NODES3" --cluster-self 127.0.0.1:6481 > /tmp/n2.log 2>&1 &
+sleep 0.5
+
+# Seed data across all three nodes (using -c for transparent routing)
+redis-cli -c -p 6479 SET hello world      # slot 866 → node 0
+redis-cli -c -p 6479 SET foo bar          # slot 12182 → node 2
+redis-cli -c -p 6479 SET counter 42       # slot 1040 → node 0
+
+echo "=== Before MEET: slot ownership ==="
+redis-cli -p 6479 CLUSTER NODES
+
+# ============================================================================================================================================
+
+# Start a 4th node with only itself (waiting to be invited)
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6482 \
+    --cluster-nodes "127.0.0.1:6482" --cluster-self 127.0.0.1:6482 > /tmp/n3.log 2>&1 &
+sleep 0.3
+
+echo "=== CLUSTER MEET: adding node 4 ==="
+redis-cli -p 6479 CLUSTER MEET 127.0.0.1 6482
+sleep 0.5
+
+echo ""
+echo "=== After MEET: cluster topology on node 0 ==="
+redis-cli -p 6479 CLUSTER NODES
+
+echo ""
+echo "=== After MEET: cluster topology on node 3 (new) ==="
+redis-cli -p 6482 CLUSTER NODES
+
+
+echo "=== Data integrity after rebalancing ==="
+echo "GET hello (slot 866 → node 0: 0-4095):"
+redis-cli -c -p 6479 GET hello
+
+echo "GET counter (slot 1040 → node 0: 0-4095):"
+redis-cli -c -p 6479 GET counter
+
+echo "GET foo (slot 12182 → node 3: 12288-16383):"
+redis-cli -c -p 6479 GET foo
+
+echo ""
+echo "=== Direct checks: data is on the RIGHT nodes ==="
+echo "hello on node 0 directly:"
+redis-cli -p 6479 GET hello
+
+echo "foo on node 3 directly (slot 12182, node 3 owns 12288-16383... actually 12182 is in node 2's range 8192-12287):"
+redis-cli -p 6479 CLUSTER KEYSLOT foo
+redis-cli -p 6481 GET foo
+
+
+
+
+NODE3_ID=$(redis-cli -p 6482 CLUSTER MYID)
+echo "Forgetting node 3: $NODE3_ID"
+redis-cli -p 6479 CLUSTER FORGET "$NODE3_ID"
+sleep 0.5
+
+echo ""
+echo "=== After FORGET: topology ==="
+redis-cli -p 6479 CLUSTER NODES
+
+echo ""
+echo "=== Data integrity after FORGET ==="
+redis-cli -c -p 6479 GET hello
+redis-cli -c -p 6479 GET foo
+redis-cli -c -p 6479 GET zz
+redis-cli -c -p 6479 GET testkey
+
+echo ""
+echo "=== Direct check: keys migrated to correct node (node 2 owns 10922-16383) ==="
+echo "zz slot: $(redis-cli -p 6479 CLUSTER KEYSLOT zz)"
+redis-cli -p 6481 GET zz
+echo "testkey slot: $(redis-cli -p 6479 CLUSTER KEYSLOT testkey)"
+redis-cli -p 6479 CLUSTER KEYSLOT testkey

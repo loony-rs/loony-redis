@@ -1,4 +1,5 @@
 /// Phase 6 — slot-based cluster sharding.
+/// Phase 7 — dynamic membership & data migration.
 ///
 /// Design
 /// ──────
@@ -11,14 +12,19 @@
 /// • When a command targets a slot owned by a different node the server
 ///   transparently proxies the request and returns the response, so ordinary
 ///   clients (not cluster-aware) work without MOVED handling.
+/// • CLUSTER MEET adds a node and auto-rebalances with minimal-movement
+///   migrations. CLUSTER FORGET gracefully drains a node and removes it.
 use bytes::BytesMut;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::debug;
+use tokio::sync::RwLock;
+use tracing::{debug, warn};
 
 use crate::protocol::{parse_frame, serialize_frame, Frame};
+use crate::storage::{Store, Value};
 
 pub const NUM_SLOTS: u16 = 16384;
 
@@ -198,6 +204,59 @@ impl ClusterConfig {
         Frame::array(ranges)
     }
 
+    // ── Dynamic membership ────────────────────────────────────────────────
+
+    /// Build a pure routing table from `nodes` (no `my_addr` required).
+    /// Used by departing nodes that need to forward their own data.
+    pub fn for_routing(mut nodes: Vec<String>) -> Self {
+        nodes.sort();
+        nodes.dedup();
+        let n = nodes.len().max(1);
+        let base = NUM_SLOTS as usize / n;
+        let mut slot_to_node = vec![0usize; NUM_SLOTS as usize];
+        for (idx, chunk) in slot_to_node.chunks_mut(base).enumerate() {
+            let owner = idx.min(n - 1);
+            for s in chunk.iter_mut() {
+                *s = owner;
+            }
+        }
+        for s in slot_to_node[base * n..].iter_mut() {
+            *s = n - 1;
+        }
+        ClusterConfig { nodes, my_index: 0, slot_to_node }
+    }
+
+    /// For each slot currently owned by this node, return which slots must
+    /// move to a different node when transitioning to `new_cfg`.
+    /// Returns: target_addr → Vec<slot>
+    pub fn slots_to_send(&self, new_cfg: &ClusterConfig) -> HashMap<String, Vec<u16>> {
+        let my_addr = self.my_addr().to_string();
+        let mut sends: HashMap<String, Vec<u16>> = HashMap::new();
+        for slot in 0..NUM_SLOTS {
+            if self.slot_to_node[slot as usize] != self.my_index {
+                continue;
+            }
+            let new_owner_idx = new_cfg.slot_to_node[slot as usize];
+            let new_owner = &new_cfg.nodes[new_owner_idx];
+            if *new_owner != my_addr {
+                sends.entry(new_owner.clone()).or_default().push(slot);
+            }
+        }
+        sends
+    }
+
+    /// All slots owned by this node.
+    pub fn my_slots(&self) -> Vec<u16> {
+        (0..NUM_SLOTS)
+            .filter(|&s| self.slot_to_node[s as usize] == self.my_index)
+            .collect()
+    }
+
+    /// Comma-separated list of all node addresses.
+    pub fn nodes_list(&self) -> String {
+        self.nodes.join(",")
+    }
+
     /// `CLUSTER SHARDS` response (Redis 7+ format used by newer redis-cli).
     pub fn cluster_shards_frame(&self) -> Frame {
         let shards: Vec<Frame> = self
@@ -231,6 +290,143 @@ impl ClusterConfig {
             })
             .collect();
         Frame::array(shards)
+    }
+}
+
+// ── Cluster state (mutable, for dynamic membership) ───────────────────────
+
+pub struct ClusterState {
+    pub config: ClusterConfig,
+}
+
+/// Shared, RwLock-protected cluster state.
+pub type SharedCluster = Arc<RwLock<ClusterState>>;
+
+// ── Migration helpers ──────────────────────────────────────────────────────
+
+/// A key entry ready for migration: (key, value, remaining_pttl_ms).
+/// pttl == -1 means no expiry; pttl == -2 means already expired (skip).
+pub type MigrateEntry = (String, Value, i64);
+
+/// Extract (and remove) all keys in `slots` from `store`.
+pub fn drain_slots(slots: &[u16], store: &Arc<Store>) -> Vec<MigrateEntry> {
+    let slot_set: std::collections::HashSet<u16> = slots.iter().copied().collect();
+    let keys: Vec<String> = store
+        .all_keys()
+        .into_iter()
+        .filter(|k| slot_set.contains(&slot_for_key(k.as_bytes())))
+        .collect();
+
+    let mut entries = Vec::new();
+    for key in keys {
+        if let Some(value) = store.get(&key) {
+            let pttl = store.pttl(&key);
+            if pttl == -2 {
+                continue; // already expired
+            }
+            store.del(&[key.clone()]);
+            entries.push((key, value, pttl));
+        }
+    }
+    entries
+}
+
+/// Build the RESP command that recreates `key` with `value` (and TTL).
+pub fn build_value_frame(key: &str, value: &Value, pttl: i64) -> Frame {
+    match value {
+        Value::String(b) => {
+            let mut cmd = vec![
+                Frame::bulk_str("SET"),
+                Frame::bulk_str(key),
+                Frame::Bulk(Some(b.clone())),
+            ];
+            if pttl > 0 {
+                cmd.push(Frame::bulk_str("PX"));
+                cmd.push(Frame::bulk_str(pttl.to_string()));
+            }
+            Frame::Array(Some(cmd))
+        }
+        Value::List(items) => Frame::Array(Some(
+            std::iter::once(Frame::bulk_str("RPUSH"))
+                .chain(std::iter::once(Frame::bulk_str(key)))
+                .chain(items.iter().map(|b| Frame::Bulk(Some(b.clone()))))
+                .collect(),
+        )),
+        Value::Hash(map) => Frame::Array(Some(
+            std::iter::once(Frame::bulk_str("HSET"))
+                .chain(std::iter::once(Frame::bulk_str(key)))
+                .chain(
+                    map.iter()
+                        .flat_map(|(f, v)| [Frame::Bulk(Some(f.clone())), Frame::Bulk(Some(v.clone()))]),
+                )
+                .collect(),
+        )),
+        Value::Set(members) => Frame::Array(Some(
+            std::iter::once(Frame::bulk_str("SADD"))
+                .chain(std::iter::once(Frame::bulk_str(key)))
+                .chain(members.iter().map(|b| Frame::Bulk(Some(b.clone()))))
+                .collect(),
+        )),
+    }
+}
+
+/// Send `entries` to `target_addr` using one persistent TCP connection.
+/// Returns the number of keys successfully written.
+pub async fn push_entries_to(target_addr: &str, entries: Vec<MigrateEntry>) -> usize {
+    if entries.is_empty() {
+        return 0;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut conn = TcpStream::connect(target_addr).await?;
+        let mut count = 0usize;
+        for (key, value, pttl) in &entries {
+            let frame = build_value_frame(key, value, *pttl);
+            conn.write_all(&serialize_frame(&frame)).await?;
+            let mut buf = BytesMut::with_capacity(64);
+            loop {
+                conn.read_buf(&mut buf).await?;
+                if parse_frame(&buf).map(|r| r.is_some()).unwrap_or(false) {
+                    break;
+                }
+            }
+            count += 1;
+        }
+        Ok::<usize, anyhow::Error>(count)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            warn!("push_entries_to {target_addr} failed: {e}");
+            0
+        }
+        Err(_) => {
+            warn!("push_entries_to {target_addr} timed out");
+            0
+        }
+    }
+}
+
+/// Send a single internal RESP command to `addr` and return the response.
+pub async fn send_internal(addr: &str, frame: Frame) -> Frame {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut conn = TcpStream::connect(addr).await?;
+        conn.write_all(&serialize_frame(&frame)).await?;
+        let mut buf = BytesMut::with_capacity(256);
+        loop {
+            conn.read_buf(&mut buf).await?;
+            if let Ok(Some((resp, _))) = parse_frame(&buf) {
+                return Ok::<Frame, anyhow::Error>(resp);
+            }
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(e)) => Frame::error(format!("ERR internal RPC to {addr} failed: {e}")),
+        Err(_) => Frame::error(format!("ERR internal RPC to {addr} timed out")),
     }
 }
 
@@ -340,9 +536,7 @@ pub async fn proxy_to(node_addr: &str, frame: Frame) -> Frame {
     }
 }
 
-// ── Public convenience type ────────────────────────────────────────────────
-
-pub type SharedCluster = Arc<ClusterConfig>;
+// (SharedCluster is defined above with ClusterState)
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
