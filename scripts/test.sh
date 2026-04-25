@@ -172,3 +172,46 @@ echo "mylist = $(redis-cli -p $NEW_LEADER LRANGE mylist 0 -1 | tr '\n' ' ')"
 
 kill $P0 $P1 $P2 2>/dev/null
 wait 2>/dev/null
+
+# ============================================================================================================================================
+
+NODES="127.0.0.1:6479,127.0.0.1:6480,127.0.0.1:6481"
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6479 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6479 > /tmp/node0.log 2>&1 &
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6480 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6480 > /tmp/node1.log 2>&1 &
+nohup ./target/release/loony-redis --host 127.0.0.1 --port 6481 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6481 > /tmp/node2.log 2>&1 &
+sleep 1
+echo "=== Node logs ==="
+cat /tmp/node0.log
+cat /tmp/node1.log
+cat /tmp/node2.log
+
+# ============================================================================================================================================
+
+# Test hash tags - {user} should land on same slot
+redis-cli -p 6479 CLUSTER KEYSLOT "{user}.name"
+redis-cli -p 6479 CLUSTER KEYSLOT "{user}.email"
+echo "--- SET both via node 0, should proxy to same node ---"
+redis-cli -p 6479 SET "{user}.name" "alice"
+redis-cli -p 6479 SET "{user}.email" "alice@example.com"
+echo "--- GET from whichever node owns that slot ---"
+redis-cli -p 6479 GET "{user}.name"
+redis-cli -p 6479 GET "{user}.email"
+
+echo "=== CROSSSLOT test ==="
+# DEL with keys from different slots should fail
+redis-cli -p 6479 DEL foo bar
+
+# ============================================================================================================================================
+
+pkill -f loony-redis 2>/dev/null; sleep 0.5
+NODES="127.0.0.1:6479,127.0.0.1:6480,127.0.0.1:6481"
+./target/release/loony-redis --host 127.0.0.1 --port 6479 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6479 > /tmp/node0.log 2>&1 &
+PID0=$!
+./target/release/loony-redis --host 127.0.0.1 --port 6480 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6480 > /tmp/node1.log 2>&1 &
+PID1=$!
+./target/release/loony-redis --host 127.0.0.1 --port 6481 --cluster-nodes "$NODES" --cluster-self 127.0.0.1:6481 > /tmp/node2.log 2>&1 &
+PID2=$!
+sleep 1
+echo "PIDs: $PID0 $PID1 $PID2"
+echo "=== Node 0 log ==="
+cat /tmp/node0.log

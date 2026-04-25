@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
+use crate::cluster::SharedCluster;
 use crate::commands::{execute, CommandContext};
 use crate::consensus::Raft;
 use crate::persistence::Aof;
@@ -17,6 +18,7 @@ pub struct Server {
     aof: Option<Arc<Aof>>,
     repl: Arc<Replication>,
     raft: Option<Arc<Raft>>,
+    cluster: Option<SharedCluster>,
 }
 
 impl Server {
@@ -25,8 +27,9 @@ impl Server {
         aof: Option<Arc<Aof>>,
         repl: Arc<Replication>,
         raft: Option<Arc<Raft>>,
+        cluster: Option<SharedCluster>,
     ) -> Self {
-        Server { store, aof, repl, raft }
+        Server { store, aof, repl, raft, cluster }
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -37,6 +40,7 @@ impl Server {
         let aof = self.aof;
         let repl = self.repl;
         let raft = self.raft;
+        let cluster = self.cluster;
 
         loop {
             let (socket, peer) = listener.accept().await?;
@@ -46,6 +50,7 @@ impl Server {
             let aof = aof.clone();
             let repl = repl.clone();
             let raft = raft.clone();
+            let cluster = cluster.clone();
 
             tokio::spawn(async move {
                 let ctx = CommandContext {
@@ -53,6 +58,7 @@ impl Server {
                     aof,
                     repl: repl.clone(),
                     raft: raft.clone(),
+                    cluster: cluster.clone(),
                     is_replica_replay: false,
                 };
                 if let Err(e) = handle_connection(socket, ctx, store, repl).await {
@@ -207,6 +213,7 @@ async fn replicate_from_leader(
                         aof: None,
                         repl: repl.clone(),
                         raft: None,
+                        cluster: None, // replicas don't reroute
                         is_replica_replay: true,
                     };
                     execute(frame, &ctx).await;

@@ -1,3 +1,4 @@
+mod cluster;
 mod commands;
 mod consensus;
 mod network;
@@ -29,7 +30,7 @@ struct Args {
 
     // ── Phase-4 async replication ──────────────────────────────────────────
 
-    /// Replicate from this leader, e.g. 127.0.0.1:6379  (Phase 4 mode)
+    /// Replicate from this leader address (Phase-4 async replication)
     #[arg(long)]
     replicaof: Option<String>,
 
@@ -39,9 +40,20 @@ struct Args {
     #[arg(long)]
     raft_addr: Option<String>,
 
-    /// Comma-separated Raft addresses of peer nodes, e.g. 127.0.0.1:7380,127.0.0.1:7381
+    /// Comma-separated Raft addresses of peer nodes
     #[arg(long)]
     peers: Option<String>,
+
+    // ── Phase-6 cluster sharding ───────────────────────────────────────────
+
+    /// All cluster node addresses (comma-separated), e.g.
+    /// 127.0.0.1:6379,127.0.0.1:6380,127.0.0.1:6381
+    #[arg(long)]
+    cluster_nodes: Option<String>,
+
+    /// This node's own address as it appears in --cluster-nodes
+    #[arg(long)]
+    cluster_self: Option<String>,
 }
 
 #[tokio::main]
@@ -56,9 +68,9 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(storage::Store::new());
 
-    // Phase-4 replication state (always needed; acts as no-op when Raft is used).
+    // Phase-4 replication state.
     let repl = if let Some(ref leader) = args.replicaof {
-        info!("Starting as replica of {leader} (Phase-4 async replication)");
+        info!("Starting as replica of {leader}");
         Arc::new(replication::Replication::new_follower(leader.clone()))
     } else {
         Arc::new(replication::Replication::new_leader())
@@ -74,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
                 aof: None,
                 repl: repl.clone(),
                 raft: None,
+                cluster: None,
                 is_replica_replay: true,
             };
             for frame in frames {
@@ -85,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // ── Phase-5: start Raft if --raft-addr and --peers are provided ────────
+    // Phase-5: Raft consensus.
     let raft = if let (Some(raft_addr), Some(peers_str)) =
         (&args.raft_addr, &args.peers)
     {
@@ -96,10 +109,8 @@ async fn main() -> anyhow::Result<()> {
             .map(String::from)
             .collect();
 
-        info!("Starting Raft node {} with peers {:?}", raft_addr, peers);
+        info!("Starting Raft node {} with {} peers", raft_addr, peers.len());
 
-        // The apply function executes a committed Raft log entry against the
-        // KV store and returns the RESP response to the waiting client.
         let store_for_apply = store.clone();
         let repl_for_apply = repl.clone();
         let apply_fn: consensus::ApplyFn = Arc::new(move |frame| {
@@ -108,26 +119,44 @@ async fn main() -> anyhow::Result<()> {
             Box::pin(async move {
                 let ctx = commands::CommandContext {
                     store,
-                    aof: None,           // no double-logging during Raft apply
+                    aof: None,
                     repl,
-                    raft: None,          // no re-entry into Raft
+                    raft: None,
+                    cluster: None,
                     is_replica_replay: true,
                 };
                 commands::execute(frame, &ctx).await
             })
         });
 
-        Some(consensus::start_raft(
-            raft_addr.clone(),
-            peers,
-            raft_addr.clone(),
-            apply_fn,
-        ).await)
+        Some(consensus::start_raft(raft_addr.clone(), peers, raft_addr.clone(), apply_fn).await)
     } else {
         None
     };
 
-    // Phase-4 follower loop (only when not using Raft).
+    // Phase-6: cluster sharding.
+    let cluster = if let (Some(nodes_str), Some(self_addr)) =
+        (&args.cluster_nodes, &args.cluster_self)
+    {
+        let nodes: Vec<String> = nodes_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+
+        let cfg = cluster::ClusterConfig::new(nodes, self_addr)?;
+        let ranges = cfg.slot_ranges_for(cfg.my_index);
+        info!(
+            "Cluster mode: node {} owns slots {:?}",
+            self_addr, ranges
+        );
+        Some(Arc::new(cfg))
+    } else {
+        None
+    };
+
+    // Phase-4 follower loop (only without Raft).
     if raft.is_none() {
         if let Some(ref leader) = args.replicaof {
             let leader = leader.clone();
@@ -139,6 +168,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let server = network::Server::new(store, aof, repl, raft);
+    let server = network::Server::new(store, aof, repl, raft, cluster);
     server.run(&format!("{}:{}", args.host, args.port)).await
 }

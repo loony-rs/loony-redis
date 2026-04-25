@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::sync::Arc;
 
+use crate::cluster::{command_slot, CommandSlot, SharedCluster};
 use crate::consensus::Raft;
 use crate::persistence::Aof;
 use crate::protocol::{serialize_frame, Frame};
@@ -13,6 +14,8 @@ pub struct CommandContext {
     pub repl: Arc<Replication>,
     /// Raft handle, present when consensus-based replication is active.
     pub raft: Option<Arc<Raft>>,
+    /// Cluster config, present when slot-based sharding is active.
+    pub cluster: Option<SharedCluster>,
     /// True when replaying commands received from the leader or from the Raft
     /// log. Skips READONLY checks and suppresses re-broadcasting/re-logging.
     pub is_replica_replay: bool,
@@ -61,6 +64,28 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
         }
     }
 
+    // ── Cluster routing ───────────────────────────────────────────────────
+    if !ctx.is_replica_replay {
+        if let Some(cluster) = &ctx.cluster {
+            // CLUSTER subcommands are always handled locally.
+            if cmd_str != "CLUSTER" {
+                match command_slot(&cmd_str, &args) {
+                    CommandSlot::CrossSlot => {
+                        return Frame::error(
+                            "CROSSSLOT Keys in request don't hash to the same slot",
+                        );
+                    }
+                    CommandSlot::Slot(slot) if !cluster.is_mine(slot) => {
+                        let target = cluster.node_for_slot(slot).to_string();
+                        let original_frame = Frame::Array(Some(args));
+                        return crate::cluster::proxy_to(&target, original_frame).await;
+                    }
+                    _ => {} // mine or no-key command — fall through
+                }
+            }
+        }
+    }
+
     // ── Phase-4 replication path ──────────────────────────────────────────
     // Reject writes on replicas (unless we're in the replay path).
     if is_write(&cmd_str) && !ctx.is_replica_replay && !ctx.repl.is_leader {
@@ -92,6 +117,7 @@ async fn dispatch(cmd_str: &str, args: &[Frame], ctx: &CommandContext) -> Frame 
         "CLIENT" => Frame::ok(),
         "COMMAND" => Frame::empty_array(),
         "CONFIG" => Frame::empty_array(),
+        "CLUSTER" => cmd_cluster(&args, ctx),
 
         // ── Keyspace ──────────────────────────────────────────────────────
         "DEL" => cmd_del(&args, ctx).await,
@@ -824,5 +850,53 @@ fn cmd_scard(args: &[Frame], ctx: &CommandContext) -> Frame {
     match ctx.store.scard(&key) {
         Ok(n) => Frame::integer(n as i64),
         Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+// ── CLUSTER commands ───────────────────────────────────────────────────────
+
+fn cmd_cluster(args: &[Frame], ctx: &CommandContext) -> Frame {
+    let sub = bulk_as_str(args, 1)
+        .map(|s| s.to_uppercase())
+        .unwrap_or_default();
+
+    match sub.as_str() {
+        "INFO" => {
+            let body = match &ctx.cluster {
+                Some(c) => c.cluster_info(),
+                None => "cluster_enabled:0\r\ncluster_state:ok\r\n".to_string(),
+            };
+            Frame::bulk_str(body)
+        }
+        "NODES" => {
+            let body = match &ctx.cluster {
+                Some(c) => c.cluster_nodes_text(),
+                None => String::new(),
+            };
+            Frame::bulk_str(body)
+        }
+        "SLOTS" => match &ctx.cluster {
+            Some(c) => c.cluster_slots_frame(),
+            None => Frame::empty_array(),
+        },
+        "SHARDS" => match &ctx.cluster {
+            Some(c) => c.cluster_shards_frame(),
+            None => Frame::empty_array(),
+        },
+        "MYID" => match &ctx.cluster {
+            Some(c) => Frame::bulk_str(crate::cluster::node_id_of(c.my_addr())),
+            None => Frame::bulk_str(""),
+        },
+        "KEYSLOT" => {
+            if args.len() < 3 {
+                return wrong_num_args("cluster|keyslot");
+            }
+            match bulk_bytes(args, 2) {
+                Some(k) => Frame::integer(crate::cluster::slot_for_key(&k) as i64),
+                None => wrong_num_args("cluster|keyslot"),
+            }
+        }
+        "RESET" => Frame::ok(),
+        _ => Frame::error(format!("ERR unknown CLUSTER subcommand `{sub}`")),
     }
 }
