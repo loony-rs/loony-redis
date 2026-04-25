@@ -6,7 +6,7 @@ use crate::consensus::Raft;
 use crate::persistence::Aof;
 use crate::protocol::{serialize_frame, Frame};
 use crate::replication::Replication;
-use crate::storage::{Store, Value};
+use crate::storage::{ScoreBound, Store, Value};
 
 pub struct CommandContext {
     pub store: Arc<Store>,
@@ -28,9 +28,11 @@ static WRITE_COMMANDS: &[&str] = &[
     "SET", "MSET", "SETNX", "GETSET", "APPEND",
     "INCR", "INCRBY", "DECR", "DECRBY",
     "DEL",
-    "LPUSH", "RPUSH", "LPOP", "RPOP",
-    "HSET", "HMSET", "HDEL",
-    "SADD", "SREM",
+    "LPUSH", "RPUSH", "LPOP", "RPOP", "LSET", "LINSERT", "LREM", "LTRIM", "LMOVE",
+    "HSET", "HMSET", "HDEL", "HINCRBY", "HINCRBYFLOAT", "HSETNX",
+    "SADD", "SREM", "SMOVE", "SPOP", "SUNIONSTORE", "SINTERSTORE", "SDIFFSTORE",
+    "ZADD", "ZREM", "ZINCRBY", "ZPOPMIN", "ZPOPMAX",
+    "ZREMRANGEBYRANK", "ZREMRANGEBYSCORE",
     "EXPIRE", "PEXPIRE", "PERSIST",
     "FLUSHDB", "FLUSHALL",
 ];
@@ -160,29 +162,64 @@ async fn dispatch(cmd_str: &str, args: &[Frame], ctx: &CommandContext) -> Frame 
         // ── Lists ─────────────────────────────────────────────────────────
         "LPUSH" => cmd_lpush(&args, ctx).await,
         "RPUSH" => cmd_rpush(&args, ctx).await,
-        "LPOP" => cmd_lpop(&args, ctx),
-        "RPOP" => cmd_rpop(&args, ctx),
-        "LLEN" => cmd_llen(&args, ctx),
+        "LPOP"  => cmd_lpop(&args, ctx),
+        "RPOP"  => cmd_rpop(&args, ctx),
+        "LLEN"  => cmd_llen(&args, ctx),
         "LRANGE" => cmd_lrange(&args, ctx),
         "LINDEX" => cmd_lindex(&args, ctx),
+        "LSET"   => cmd_lset(&args, ctx),
+        "LINSERT" => cmd_linsert(&args, ctx),
+        "LREM"   => cmd_lrem(&args, ctx),
+        "LTRIM"  => cmd_ltrim(&args, ctx),
+        "LMOVE"  => cmd_lmove(&args, ctx),
 
         // ── Hashes ────────────────────────────────────────────────────────
         "HSET" | "HMSET" => cmd_hset(&args, ctx).await,
-        "HGET" => cmd_hget(&args, ctx),
-        "HMGET" => cmd_hmget(&args, ctx),
+        "HGET"    => cmd_hget(&args, ctx),
+        "HMGET"   => cmd_hmget(&args, ctx),
         "HGETALL" => cmd_hgetall(&args, ctx),
-        "HDEL" => cmd_hdel(&args, ctx),
-        "HLEN" => cmd_hlen(&args, ctx),
+        "HDEL"    => cmd_hdel(&args, ctx),
+        "HLEN"    => cmd_hlen(&args, ctx),
         "HEXISTS" => cmd_hexists(&args, ctx),
-        "HKEYS" => cmd_hkeys(&args, ctx),
-        "HVALS" => cmd_hvals(&args, ctx),
+        "HKEYS"   => cmd_hkeys(&args, ctx),
+        "HVALS"   => cmd_hvals(&args, ctx),
+        "HSETNX"  => cmd_hsetnx(&args, ctx).await,
+        "HINCRBY" => cmd_hincrby(&args, ctx).await,
+        "HINCRBYFLOAT" => cmd_hincrbyfloat(&args, ctx).await,
 
         // ── Sets ──────────────────────────────────────────────────────────
-        "SADD" => cmd_sadd(&args, ctx).await,
+        "SADD"     => cmd_sadd(&args, ctx).await,
         "SMEMBERS" => cmd_smembers(&args, ctx),
         "SISMEMBER" => cmd_sismember(&args, ctx),
-        "SREM" => cmd_srem(&args, ctx),
-        "SCARD" => cmd_scard(&args, ctx),
+        "SREM"     => cmd_srem(&args, ctx),
+        "SCARD"    => cmd_scard(&args, ctx),
+        "SMOVE"    => cmd_smove(&args, ctx),
+        "SRANDMEMBER" => cmd_srandmember(&args, ctx),
+        "SPOP"     => cmd_spop(&args, ctx),
+        "SUNION"   => cmd_sunion(&args, ctx),
+        "SINTER"   => cmd_sinter(&args, ctx),
+        "SDIFF"    => cmd_sdiff(&args, ctx),
+        "SUNIONSTORE" => cmd_sunionstore(&args, ctx),
+        "SINTERSTORE" => cmd_sinterstore(&args, ctx),
+        "SDIFFSTORE"  => cmd_sdiffstore(&args, ctx),
+
+        // ── Sorted sets ───────────────────────────────────────────────────
+        "ZADD"   => cmd_zadd(&args, ctx).await,
+        "ZSCORE" => cmd_zscore(&args, ctx),
+        "ZRANK"  => cmd_zrank(&args, ctx),
+        "ZREVRANK" => cmd_zrevrank(&args, ctx),
+        "ZCARD"  => cmd_zcard(&args, ctx),
+        "ZCOUNT" => cmd_zcount(&args, ctx),
+        "ZINCRBY" => cmd_zincrby(&args, ctx).await,
+        "ZREM"   => cmd_zrem(&args, ctx),
+        "ZRANGE" => cmd_zrange(&args, ctx),
+        "ZREVRANGE" => cmd_zrevrange(&args, ctx),
+        "ZRANGEBYSCORE" => cmd_zrangebyscore(&args, ctx),
+        "ZREVRANGEBYSCORE" => cmd_zrevrangebyscore(&args, ctx),
+        "ZPOPMIN" => cmd_zpopmin(&args, ctx),
+        "ZPOPMAX" => cmd_zpopmax(&args, ctx),
+        "ZREMRANGEBYRANK"  => cmd_zremrangebyrank(&args, ctx),
+        "ZREMRANGEBYSCORE" => cmd_zremrangebyscore(&args, ctx),
 
         _ => Frame::error(format!("ERR unknown command `{cmd_str}`")),
     }
@@ -588,9 +625,19 @@ fn cmd_lpop(args: &[Frame], ctx: &CommandContext) -> Frame {
         return wrong_num_args("lpop");
     }
     let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("lpop") };
-    match ctx.store.lpop(&key) {
-        Ok(Some(v)) => Frame::Bulk(Some(v)),
-        Ok(None) => Frame::null_bulk(),
+    let count = bulk_as_i64(args, 2).unwrap_or(1).max(0) as usize;
+    let with_count = args.len() >= 3;
+    match ctx.store.lpop(&key, count.max(1)) {
+        Ok(mut v) => {
+            if with_count {
+                Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect()))
+            } else {
+                match v.pop() {
+                    Some(b) => Frame::Bulk(Some(b)),
+                    None => Frame::null_bulk(),
+                }
+            }
+        }
         Err(e) => Frame::error(e.to_string()),
     }
 }
@@ -600,9 +647,19 @@ fn cmd_rpop(args: &[Frame], ctx: &CommandContext) -> Frame {
         return wrong_num_args("rpop");
     }
     let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("rpop") };
-    match ctx.store.rpop(&key) {
-        Ok(Some(v)) => Frame::Bulk(Some(v)),
-        Ok(None) => Frame::null_bulk(),
+    let count = bulk_as_i64(args, 2).unwrap_or(1).max(0) as usize;
+    let with_count = args.len() >= 3;
+    match ctx.store.rpop(&key, count.max(1)) {
+        Ok(mut v) => {
+            if with_count {
+                Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect()))
+            } else {
+                match v.pop() {
+                    Some(b) => Frame::Bulk(Some(b)),
+                    None => Frame::null_bulk(),
+                }
+            }
+        }
         Err(e) => Frame::error(e.to_string()),
     }
 }
@@ -1243,5 +1300,514 @@ async fn cmd_migrate(args: &[Frame], ctx: &CommandContext) -> Frame {
         }
         Frame::Error(e) => Frame::error(format!("ERR target: {e}")),
         _ => Frame::error("ERR unexpected response from migration target"),
+    }
+}
+
+// ── Extended List commands ─────────────────────────────────────────────────
+
+fn cmd_lset(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("lset"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("lset") };
+    let index = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid index") };
+    let val   = match bulk_bytes(args, 3)  { Some(v) => v, None => return wrong_num_args("lset") };
+    match ctx.store.lset(&key, index, val) {
+        Ok(true)  => Frame::ok(),
+        Ok(false) => Frame::error("ERR index out of range"),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_linsert(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 5 { return wrong_num_args("linsert"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("linsert") };
+    let pos   = match bulk_as_str(args, 2) { Some(p) => p, None => return wrong_num_args("linsert") };
+    let pivot = match bulk_bytes(args, 3)  { Some(v) => v, None => return wrong_num_args("linsert") };
+    let val   = match bulk_bytes(args, 4)  { Some(v) => v, None => return wrong_num_args("linsert") };
+    let before = match pos.to_uppercase().as_str() {
+        "BEFORE" => true,
+        "AFTER"  => false,
+        _ => return Frame::error("ERR syntax error"),
+    };
+    match ctx.store.linsert(&key, before, pivot, val) {
+        Ok(n)  => Frame::integer(n),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_lrem(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("lrem"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("lrem") };
+    let count = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid count") };
+    let val   = match bulk_bytes(args, 3)  { Some(v) => v, None => return wrong_num_args("lrem") };
+    match ctx.store.lrem(&key, count, val) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_ltrim(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("ltrim"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("ltrim") };
+    let start = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid start") };
+    let stop  = match bulk_as_i64(args, 3) { Some(n) => n, None => return Frame::error("ERR invalid stop") };
+    match ctx.store.ltrim(&key, start, stop) {
+        Ok(()) => Frame::ok(),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_lmove(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // LMOVE source dest LEFT|RIGHT LEFT|RIGHT
+    if args.len() != 5 { return wrong_num_args("lmove"); }
+    let src     = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("lmove") };
+    let dst     = match bulk_as_str(args, 2) { Some(k) => k, None => return wrong_num_args("lmove") };
+    let wherefrom = match bulk_as_str(args, 3) { Some(s) => s, None => return wrong_num_args("lmove") };
+    let whereto   = match bulk_as_str(args, 4) { Some(s) => s, None => return wrong_num_args("lmove") };
+    let from_left = match wherefrom.to_uppercase().as_str() {
+        "LEFT"  => true,
+        "RIGHT" => false,
+        _ => return Frame::error("ERR syntax error"),
+    };
+    let to_left = match whereto.to_uppercase().as_str() {
+        "LEFT"  => true,
+        "RIGHT" => false,
+        _ => return Frame::error("ERR syntax error"),
+    };
+    match ctx.store.lmove(&src, &dst, from_left, to_left) {
+        Ok(Some(v)) => Frame::Bulk(Some(v)),
+        Ok(None)    => Frame::null_bulk(),
+        Err(e)      => Frame::error(e.to_string()),
+    }
+}
+
+// ── Extended Hash commands ─────────────────────────────────────────────────
+
+async fn cmd_hsetnx(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("hsetnx"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("hsetnx") };
+    let field = match bulk_bytes(args, 2)  { Some(f) => f, None => return wrong_num_args("hsetnx") };
+    let val   = match bulk_bytes(args, 3)  { Some(v) => v, None => return wrong_num_args("hsetnx") };
+    match ctx.store.hsetnx(key, field, val) {
+        Ok(set) => Frame::integer(if set { 1 } else { 0 }),
+        Err(e)  => Frame::error(e.to_string()),
+    }
+}
+
+async fn cmd_hincrby(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("hincrby"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("hincrby") };
+    let field = match bulk_bytes(args, 2)  { Some(f) => f, None => return wrong_num_args("hincrby") };
+    let delta = match bulk_as_i64(args, 3) { Some(n) => n, None => return Frame::error("ERR not an integer") };
+    match ctx.store.hincrby(key, field, delta) {
+        Ok(n)  => Frame::integer(n),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+async fn cmd_hincrbyfloat(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("hincrbyfloat"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("hincrbyfloat") };
+    let field = match bulk_bytes(args, 2)  { Some(f) => f, None => return wrong_num_args("hincrbyfloat") };
+    let delta: f64 = match bulk_as_str(args, 3).as_deref().and_then(|s| s.parse().ok()) {
+        Some(v) => v,
+        None    => return Frame::error("ERR not a float"),
+    };
+    match ctx.store.hincrbyfloat(key, field, delta) {
+        Ok(v)  => Frame::bulk_str(format!("{v}")),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+// ── Extended Set commands ──────────────────────────────────────────────────
+
+fn cmd_smove(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("smove"); }
+    let src    = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("smove") };
+    let dst    = match bulk_as_str(args, 2) { Some(k) => k, None => return wrong_num_args("smove") };
+    let member = match bulk_bytes(args, 3)  { Some(m) => m, None => return wrong_num_args("smove") };
+    match ctx.store.smove(&src, &dst, &member) {
+        Ok(b)  => Frame::integer(if b { 1 } else { 0 }),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_srandmember(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("srandmember"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("srandmember") };
+    let count = bulk_as_i64(args, 2);
+    match ctx.store.srandmember(&key, count.unwrap_or(1)) {
+        Err(e) => Frame::error(e.to_string()),
+        Ok(v) => {
+            if count.is_none() {
+                // No count arg: return single element or nil
+                match v.into_iter().next() {
+                    Some(b) => Frame::Bulk(Some(b)),
+                    None    => Frame::null_bulk(),
+                }
+            } else {
+                Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect()))
+            }
+        }
+    }
+}
+
+fn cmd_spop(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("spop"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("spop") };
+    let count = bulk_as_i64(args, 2).map(|n| n.max(0) as usize);
+    let n = count.unwrap_or(1);
+    match ctx.store.spop(&key, n) {
+        Err(e) => Frame::error(e.to_string()),
+        Ok(v) => {
+            if count.is_none() {
+                match v.into_iter().next() {
+                    Some(b) => Frame::Bulk(Some(b)),
+                    None    => Frame::null_bulk(),
+                }
+            } else {
+                Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect()))
+            }
+        }
+    }
+}
+
+fn multi_key_set_args(args: &[Frame], start: usize) -> Vec<String> {
+    args[start..].iter().filter_map(|f| match f {
+        Frame::Bulk(Some(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }).collect()
+}
+
+fn cmd_sunion(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("sunion"); }
+    let keys = multi_key_set_args(args, 1);
+    match ctx.store.sunion(&keys) {
+        Ok(v)  => Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect())),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_sinter(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("sinter"); }
+    let keys = multi_key_set_args(args, 1);
+    match ctx.store.sinter(&keys) {
+        Ok(v)  => Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect())),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_sdiff(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("sdiff"); }
+    let keys = multi_key_set_args(args, 1);
+    match ctx.store.sdiff(&keys) {
+        Ok(v)  => Frame::Array(Some(v.into_iter().map(|b| Frame::Bulk(Some(b))).collect())),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_sunionstore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("sunionstore"); }
+    let dst  = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("sunionstore") };
+    let keys = multi_key_set_args(args, 2);
+    match ctx.store.sunionstore(&dst, &keys) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_sinterstore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("sinterstore"); }
+    let dst  = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("sinterstore") };
+    let keys = multi_key_set_args(args, 2);
+    match ctx.store.sinterstore(&dst, &keys) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_sdiffstore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("sdiffstore"); }
+    let dst  = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("sdiffstore") };
+    let keys = multi_key_set_args(args, 2);
+    match ctx.store.sdiffstore(&dst, &keys) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+// ── Sorted-set commands ────────────────────────────────────────────────────
+
+async fn cmd_zadd(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
+    if args.len() < 4 { return wrong_num_args("zadd"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zadd") };
+
+    let mut nx = false; let mut xx = false;
+    let mut gt = false; let mut lt = false;
+    let mut ch = false;
+    let mut i = 2usize;
+
+    // Consume flags
+    loop {
+        match bulk_as_str(args, i).as_deref() {
+            Some("NX") => { nx = true; i += 1; }
+            Some("XX") => { xx = true; i += 1; }
+            Some("GT") => { gt = true; i += 1; }
+            Some("LT") => { lt = true; i += 1; }
+            Some("CH") => { ch = true; i += 1; }
+            _ => break,
+        }
+    }
+
+    if i + 1 >= args.len() { return wrong_num_args("zadd"); }
+
+    let mut added = 0usize;
+    let mut changed = 0usize;
+    while i + 1 < args.len() {
+        let score_s = match bulk_as_str(args, i) { Some(s) => s, None => { i += 2; continue } };
+        let score: f64 = match score_s.parse() {
+            Ok(v) => v,
+            Err(_) => return Frame::error("ERR value is not a valid float"),
+        };
+        let member = match bulk_bytes(args, i + 1) { Some(m) => m, None => { i += 2; continue } };
+        match ctx.store.zadd(key.clone(), score, member, nx, xx, gt, lt) {
+            Ok((a, c)) => { added += a; changed += c; }
+            Err(e) => return Frame::error(e.to_string()),
+        }
+        i += 2;
+    }
+
+    let result = if ch { changed } else { added };
+
+    if result > 0 {
+        if let Some(aof) = &ctx.aof {
+            // Re-build the original command for AOF logging.
+            let parts: Vec<&[u8]> = std::iter::once(b"ZADD".as_slice())
+                .chain(std::iter::once(key.as_bytes()))
+                .collect();
+            let _ = aof.log_generic(&parts).await;
+        }
+    }
+    Frame::integer(result as i64)
+}
+
+fn cmd_zscore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 3 { return wrong_num_args("zscore"); }
+    let key    = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zscore") };
+    let member = match bulk_bytes(args, 2)  { Some(m) => m, None => return wrong_num_args("zscore") };
+    match ctx.store.zscore(&key, &member) {
+        Ok(Some(s)) => Frame::bulk_str(format!("{s}")),
+        Ok(None)    => Frame::null_bulk(),
+        Err(e)      => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zrank(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("zrank"); }
+    let key    = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrank") };
+    let member = match bulk_bytes(args, 2)  { Some(m) => m, None => return wrong_num_args("zrank") };
+    match ctx.store.zrank(&key, &member) {
+        Ok(Some(r)) => Frame::integer(r as i64),
+        Ok(None)    => Frame::null_bulk(),
+        Err(e)      => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zrevrank(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("zrevrank"); }
+    let key    = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrevrank") };
+    let member = match bulk_bytes(args, 2)  { Some(m) => m, None => return wrong_num_args("zrevrank") };
+    match ctx.store.zrevrank(&key, &member) {
+        Ok(Some(r)) => Frame::integer(r as i64),
+        Ok(None)    => Frame::null_bulk(),
+        Err(e)      => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zcard(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 2 { return wrong_num_args("zcard"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zcard") };
+    match ctx.store.zcard(&key) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zcount(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("zcount"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zcount") };
+    let min = match bulk_as_str(args, 2).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR min is not a float"),
+    };
+    let max = match bulk_as_str(args, 3).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR max is not a float"),
+    };
+    match ctx.store.zcount(&key, min, max) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+async fn cmd_zincrby(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("zincrby"); }
+    let key    = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zincrby") };
+    let delta: f64 = match bulk_as_str(args, 2).as_deref().and_then(|s| s.parse().ok()) {
+        Some(v) => v, None => return Frame::error("ERR not a float"),
+    };
+    let member = match bulk_bytes(args, 3)  { Some(m) => m, None => return wrong_num_args("zincrby") };
+    match ctx.store.zincrby(key, delta, member) {
+        Ok(s)  => Frame::bulk_str(format!("{s}")),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zrem(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 3 { return wrong_num_args("zrem"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrem") };
+    let members: Vec<Bytes> = args[2..].iter().filter_map(|f| match f {
+        Frame::Bulk(Some(b)) => Some(b.clone()),
+        _ => None,
+    }).collect();
+    match ctx.store.zrem(&key, &members) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn zset_pairs_to_frame(pairs: Vec<(Bytes, f64)>, withscores: bool) -> Frame {
+    let mut items = Vec::with_capacity(pairs.len() * if withscores { 2 } else { 1 });
+    for (member, score) in pairs {
+        items.push(Frame::Bulk(Some(member)));
+        if withscores {
+            items.push(Frame::bulk_str(format!("{score}")));
+        }
+    }
+    Frame::Array(Some(items))
+}
+
+fn has_withscores(args: &[Frame], from: usize) -> bool {
+    args[from..].iter().any(|f| {
+        matches!(f, Frame::Bulk(Some(b)) if b.to_ascii_uppercase() == b"WITHSCORES")
+    })
+}
+
+fn cmd_zrange(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // ZRANGE key start stop [WITHSCORES]
+    if args.len() < 4 { return wrong_num_args("zrange"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrange") };
+    let start = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid start") };
+    let stop  = match bulk_as_i64(args, 3) { Some(n) => n, None => return Frame::error("ERR invalid stop") };
+    let ws = has_withscores(args, 4);
+    match ctx.store.zrange(&key, start, stop, false) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, ws),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zrevrange(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 4 { return wrong_num_args("zrevrange"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrevrange") };
+    let start = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid start") };
+    let stop  = match bulk_as_i64(args, 3) { Some(n) => n, None => return Frame::error("ERR invalid stop") };
+    let ws = has_withscores(args, 4);
+    match ctx.store.zrange(&key, start, stop, true) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, ws),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn parse_limit(args: &[Frame], from: usize) -> (usize, Option<usize>) {
+    // [LIMIT offset count]
+    for i in from..args.len().saturating_sub(2) {
+        if let Some(s) = bulk_as_str(args, i) {
+            if s.to_uppercase() == "LIMIT" {
+                let offset = bulk_as_i64(args, i + 1).unwrap_or(0).max(0) as usize;
+                let count  = bulk_as_i64(args, i + 2).map(|n| if n < 0 { usize::MAX } else { n as usize });
+                return (offset, count);
+            }
+        }
+    }
+    (0, None)
+}
+
+fn cmd_zrangebyscore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+    if args.len() < 4 { return wrong_num_args("zrangebyscore"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrangebyscore") };
+    let min = match bulk_as_str(args, 2).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR min is not a float"),
+    };
+    let max = match bulk_as_str(args, 3).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR max is not a float"),
+    };
+    let ws = has_withscores(args, 4);
+    let (offset, limit) = parse_limit(args, 4);
+    match ctx.store.zrangebyscore(&key, min, max, offset, limit, false) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, ws),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zrevrangebyscore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    // ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+    if args.len() < 4 { return wrong_num_args("zrevrangebyscore"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zrevrangebyscore") };
+    let max = match bulk_as_str(args, 2).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR max is not a float"),
+    };
+    let min = match bulk_as_str(args, 3).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR min is not a float"),
+    };
+    let ws = has_withscores(args, 4);
+    let (offset, limit) = parse_limit(args, 4);
+    match ctx.store.zrangebyscore(&key, min, max, offset, limit, true) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, ws),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zpopmin(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("zpopmin"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zpopmin") };
+    let count = bulk_as_i64(args, 2).map(|n| n.max(0) as usize).unwrap_or(1);
+    match ctx.store.zpopmin(&key, count) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, true),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zpopmax(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() < 2 { return wrong_num_args("zpopmax"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zpopmax") };
+    let count = bulk_as_i64(args, 2).map(|n| n.max(0) as usize).unwrap_or(1);
+    match ctx.store.zpopmax(&key, count) {
+        Ok(pairs) => zset_pairs_to_frame(pairs, true),
+        Err(e)    => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zremrangebyrank(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("zremrangebyrank"); }
+    let key   = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zremrangebyrank") };
+    let start = match bulk_as_i64(args, 2) { Some(n) => n, None => return Frame::error("ERR invalid start") };
+    let stop  = match bulk_as_i64(args, 3) { Some(n) => n, None => return Frame::error("ERR invalid stop") };
+    match ctx.store.zremrangebyrank(&key, start, stop) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+fn cmd_zremrangebyscore(args: &[Frame], ctx: &CommandContext) -> Frame {
+    if args.len() != 4 { return wrong_num_args("zremrangebyscore"); }
+    let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("zremrangebyscore") };
+    let min = match bulk_as_str(args, 2).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR min is not a float"),
+    };
+    let max = match bulk_as_str(args, 3).as_deref().and_then(ScoreBound::parse) {
+        Some(b) => b, None => return Frame::error("ERR max is not a float"),
+    };
+    match ctx.store.zremrangebyscore(&key, min, max) {
+        Ok(n)  => Frame::integer(n as i64),
+        Err(e) => Frame::error(e.to_string()),
     }
 }

@@ -95,6 +95,18 @@ pub fn snapshot_entry_to_resp(entry: &SnapshotEntry) -> Bytes {
             args.extend(members.iter().map(|b| Frame::Bulk(Some(b.clone()))));
             Frame::array(args)
         }
+
+        SnapshotEntry::ZSet { key, members } => {
+            let mut args = vec![
+                Frame::bulk_str("ZADD"),
+                Frame::Bulk(Some(Bytes::from(key.clone().into_bytes()))),
+            ];
+            for (member, score) in members {
+                args.push(Frame::bulk_str(format!("{score}")));
+                args.push(Frame::Bulk(Some(member.clone())));
+            }
+            Frame::array(args)
+        }
     };
 
     serialize_frame(&frame)

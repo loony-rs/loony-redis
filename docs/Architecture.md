@@ -184,6 +184,67 @@ The cluster `RwLock` is always acquired, the routing decision made, and the lock
 
 ---
 
+## Phase 9 — Advanced Data Structures
+
+**Files:** `src/storage/list.rs`, `src/storage/hash.rs`, `src/storage/set.rs`, `src/storage/zset.rs`
+
+### Compact encoding (listpack equivalent)
+
+Small collections use a flat, cache-friendly layout that avoids the per-node overhead of hash tables and ring buffers:
+
+| Type | Small encoding | Large encoding | Promote when |
+|---|---|---|---|
+| List | `Vec<Bytes>` | `VecDeque<Bytes>` | entries > 128 **or** any element > 64 bytes |
+| Hash | `Vec<(Bytes, Bytes)>` | `HashMap<Bytes, Bytes>` | fields > 128 **or** any key/value > 64 bytes |
+| Set  | `Vec<Bytes>` | `HashSet<Bytes>` | members > 128 **or** any member > 64 bytes |
+
+Promotion is one-way and happens transparently on insert. The thresholds match Redis's `hash-max-listpack-entries`, `set-max-intset-entries` defaults.
+
+**Memory impact:** a 10-field hash in the small encoding costs one `Vec` allocation (~3 words of heap header + contiguous `(Bytes, Bytes)` pairs). The large encoding adds a `HashMap` with its bucket array, load factor, and per-entry metadata — roughly 3–5× more allocator overhead at small sizes.
+
+**Lock granularity note:** each DashMap shard (64 by default) serialises operations on keys that hash to it. For most workloads this is sufficient. A further improvement — wrapping each entry in `Arc<std::sync::RwLock<Entry>>` so readers on the same key don't block writes to other keys in the same shard — is deferred to Phase 11 (performance), where it can be profiled against actual workloads to verify the trade-off (two extra atomic ops per access vs. reduced contention under high concurrency).
+
+### ZSet (Sorted Set)
+
+**File:** `src/storage/zset.rs`
+
+Backed by a dual index:
+
+```
+ZSet {
+    scores:   HashMap<Bytes, f64>          — O(1) ZSCORE, ZINCRBY, ZREM
+    by_score: BTreeMap<ScoreKey, ()>       — O(log n) ZRANK, ZRANGE, ZCOUNT
+}
+```
+
+`ScoreKey = (encoded_u64, member: Bytes)` where the encoding maps `f64` bits to `u64` such that the natural unsigned integer ordering matches float ordering:
+
+```
+positive (sign bit = 0):  set sign bit  → 1xxx…  (sorts after all negatives)
+negative (sign bit = 1):  flip all bits → 0yyy…  (reverses the negative sub-range)
+```
+
+This gives the total order: `−∞ < negative floats < −0.0 < +0.0 < positive floats < +∞`, exactly matching Redis's ZSET semantics. NaN is rejected at the command layer.
+
+The secondary sort key (the member bytes) breaks ties when two members have equal scores, producing a stable, deterministic rank for all entries.
+
+#### Complexity summary
+
+| Command | Time |
+|---|---|
+| `ZADD` (update existing) | O(log n) |
+| `ZADD` (new member) | O(log n) |
+| `ZSCORE` | O(1) |
+| `ZRANK` / `ZREVRANK` | O(log n) |
+| `ZINCRBY` | O(log n) |
+| `ZREM` | O(log n) |
+| `ZRANGE` by rank | O(log n + k) |
+| `ZRANGEBYSCORE` | O(log n + k) |
+| `ZPOPMIN` / `ZPOPMAX` | O(log n) |
+| `ZCOUNT` | O(log n + k) |
+
+---
+
 ## What Is Not Implemented
 
 - **RDB snapshots** — AOF only.

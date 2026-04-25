@@ -2,14 +2,15 @@
 
 A Redis-compatible, distributed, fault-tolerant in-memory key-value store written entirely in Rust.
 
-Built from scratch across 8 engineering phases — from a single-node KV engine to a fully distributed cluster with Raft consensus, dynamic membership, and automatic fault recovery.
+Built from scratch across 9 engineering phases — from a single-node KV engine to a fully distributed cluster with Raft consensus, dynamic membership, automatic fault recovery, and a complete Redis data-structure surface.
 
 ## Features
 
 | Capability | Details |
 |---|---|
 | **Redis RESP protocol** | Compatible with `redis-cli` and any Redis client |
-| **Data types** | Strings, Lists, Hashes, Sets |
+| **Data types** | Strings, Lists, Hashes, Sets, Sorted Sets (ZSet) |
+| **Compact encoding** | Listpack-equivalent small-collection encoding; auto-promotes at 128 entries / 64-byte values |
 | **Persistence** | Append-Only File (AOF) with crash recovery |
 | **Replication** | Async leader–follower streaming with full snapshot sync |
 | **Consensus** | Raft-based leader election and log replication |
@@ -114,13 +115,16 @@ Logging verbosity is controlled by the `RUST_LOG` environment variable (default:
 `GET`, `SET` _(EX / PX / NX / XX)_, `MGET`, `MSET`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `GETSET`, `SETNX`
 
 ### Lists
-`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `LINDEX`
+`LPUSH`, `RPUSH`, `LPOP` _(count)_, `RPOP` _(count)_, `LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LINSERT`, `LREM`, `LTRIM`, `LMOVE`
 
 ### Hashes
-`HSET`, `HMSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HLEN`, `HEXISTS`, `HKEYS`, `HVALS`
+`HSET`, `HMSET`, `HGET`, `HMGET`, `HGETALL`, `HDEL`, `HLEN`, `HEXISTS`, `HKEYS`, `HVALS`, `HSETNX`, `HINCRBY`, `HINCRBYFLOAT`
 
 ### Sets
-`SADD`, `SMEMBERS`, `SISMEMBER`, `SREM`, `SCARD`
+`SADD`, `SMEMBERS`, `SISMEMBER`, `SREM`, `SCARD`, `SMOVE`, `SPOP`, `SRANDMEMBER`, `SUNION`, `SINTER`, `SDIFF`, `SUNIONSTORE`, `SINTERSTORE`, `SDIFFSTORE`
+
+### Sorted Sets
+`ZADD` _(NX/XX/GT/LT/CH)_, `ZSCORE`, `ZRANK`, `ZREVRANK`, `ZCARD`, `ZCOUNT`, `ZINCRBY`, `ZREM`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZPOPMIN`, `ZPOPMAX`, `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`
 
 ### Cluster
 `CLUSTER INFO`, `CLUSTER NODES`, `CLUSTER SLOTS`, `CLUSTER SHARDS`, `CLUSTER MYID`, `CLUSTER KEYSLOT`, `CLUSTER MEET`, `CLUSTER FORGET`, `CLUSTER HEALTH`, `MIGRATE`
@@ -162,32 +166,39 @@ See [docs/Architecture.md](docs/Architecture.md) for full design details.
 cargo test
 ```
 
-22 unit tests covering CRC16 vectors, hash tags, slot distribution, and cluster config edge cases.
+29 unit tests covering CRC16 vectors, hash tags, slot distribution, cluster config, ZSet score ordering, rank/range queries, compact encoding, set algebra, and list mutations.
 
 ## Project Layout
 
 ```
 src/
-  main.rs          CLI argument parsing, startup sequencing
-  network/         Async TCP server, connection handler, replication stream
-  commands/        Command dispatcher, all command implementations
-  storage/         In-memory store (DashMap), all data types, TTL
-  protocol/        RESP parser and serializer
-  persistence/     AOF write-ahead log, replay on startup
-  replication/     Leader broadcast channel, follower sync loop
-  consensus/       Raft state machine, leader election, log replication
-  cluster/         Hash slots, routing, migration, heartbeat, gossip
+  main.rs            CLI argument parsing, startup sequencing
+  network/           Async TCP server, connection handler, replication stream
+  commands/          Command dispatcher, all command implementations
+  storage/
+    mod.rs           Store, Value, SnapshotEntry, all store methods
+    list.rs          List — compact Vec / VecDeque dual encoding
+    hash.rs          Hash — compact Vec-of-pairs / HashMap dual encoding
+    set.rs           Set — compact Vec / HashSet dual encoding + algebra
+    zset.rs          ZSet — BTreeMap score index + HashMap member→score
+  protocol/          RESP parser and serializer
+  persistence/       AOF write-ahead log, replay on startup
+  replication/       Leader broadcast channel, follower sync loop
+  consensus/         Raft state machine, leader election, log replication
+  cluster/           Hash slots, routing, migration, heartbeat, gossip
 docs/
-  Architecture.md  Deep-dive design and trade-off notes
-  ClusterGuide.md  Cluster operations: meet, forget, health, fault recovery
-  Commands.md      Full command reference with examples
+  Architecture.md    Deep-dive design and trade-off notes
+  ClusterGuide.md    Cluster operations: meet, forget, health, fault recovery
+  Commands.md        Full command reference with examples
 scripts/
-  test.sh          End-to-end integration test script
+  test.sh            End-to-end integration test script
 ```
 
 ## Design Highlights
 
 - **No unsafe Rust** — all concurrency through `Arc`, `tokio::sync::RwLock`, and `DashMap`.
+- **Compact encoding** — small collections use flat `Vec`-based storage matching Redis's listpack layout; automatically promoted to `VecDeque` / `HashMap` / `HashSet` when either the entry count (128) or element size (64 bytes) threshold is exceeded.
+- **ZSet dual index** — `HashMap<member→score>` for O(1) score lookup; `BTreeMap<ScoreKey,()>` for O(log n) rank and range queries. `ScoreKey` reinterprets `f64` bits as `u64` with a sign-magnitude fix so the unsigned integer ordering matches float ordering exactly.
 - **Deterministic routing** — every node independently derives the same slot table from a sorted node list; no gossip round-trip needed for routing decisions.
 - **Transparent proxying** — ordinary `redis-cli` works against any shard without `MOVED` handling.
 - **Gossip is pessimistic** — node state only moves toward `Failed` via gossip; recovery requires a direct successful heartbeat.

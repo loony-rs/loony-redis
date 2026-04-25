@@ -50,7 +50,7 @@ Returns the number of provided keys that exist.
 ```
 
 ### TYPE key
-Returns `string`, `list`, `hash`, `set`, or `none`.
+Returns `string`, `list`, `hash`, `set`, `zset`, or `none`.
 
 ### EXPIRE key seconds
 Set a timeout (seconds) on a key. Returns `1` if set, `0` if key does not exist.
@@ -152,11 +152,20 @@ Prepends values to a list. Returns the new list length.
 ### RPUSH key value [value ...]
 Appends values to a list.
 
-### LPOP key
-Removes and returns the first element.
+### LPOP key [count]
+Removes and returns the first element. With `count`, removes and returns up to `count` elements as an array.
+```
+> RPUSH items a b c d
+(integer) 4
+> LPOP items
+"a"
+> LPOP items 2
+1) "b"
+2) "c"
+```
 
-### RPOP key
-Removes and returns the last element.
+### RPOP key [count]
+Removes and returns the last element. With `count`, removes and returns up to `count` elements as an array (from tail toward head).
 
 ### LLEN key
 Returns the list length.
@@ -173,7 +182,65 @@ Returns elements from `start` to `stop` (inclusive). Negative indices count from
 ```
 
 ### LINDEX key index
-Returns the element at `index`.
+Returns the element at `index`. Returns `(nil)` if out of range.
+
+### LSET key index value
+Sets the element at `index` to `value`. Returns `OK`. Errors if out of range.
+```
+> RPUSH items a b c
+(integer) 3
+> LSET items 1 B
+OK
+> LRANGE items 0 -1
+1) "a"
+2) "B"
+3) "c"
+```
+
+### LINSERT key BEFORE|AFTER pivot value
+Inserts `value` immediately before or after the first occurrence of `pivot`. Returns the new list length, or `-1` if `pivot` is not found.
+```
+> RPUSH items a c
+(integer) 2
+> LINSERT items BEFORE c b
+(integer) 3
+> LRANGE items 0 -1
+1) "a"
+2) "b"
+3) "c"
+```
+
+### LREM key count value
+Removes occurrences of `value` from the list:
+- `count > 0` — remove up to `count` from the head.
+- `count < 0` — remove up to `|count|` from the tail.
+- `count = 0` — remove all occurrences.
+
+Returns the number of elements removed.
+
+### LTRIM key start stop
+Trims the list to the range `[start, stop]`, discarding all elements outside it. Returns `OK`.
+```
+> RPUSH items a b c d e
+(integer) 5
+> LTRIM items 1 3
+OK
+> LRANGE items 0 -1
+1) "b"
+2) "c"
+3) "d"
+```
+
+### LMOVE source destination LEFT|RIGHT LEFT|RIGHT
+Atomically pops one element from `source` (from `LEFT` or `RIGHT`) and pushes it to `destination` (to `LEFT` or `RIGHT`). Returns the moved element.
+```
+> RPUSH src a b c
+(integer) 3
+> LMOVE src dst LEFT RIGHT
+"a"
+> LRANGE dst 0 -1
+1) "a"
+```
 
 ---
 
@@ -216,6 +283,27 @@ Returns all field names.
 ### HVALS key
 Returns all field values.
 
+### HSETNX key field value
+Sets `field` only if it does not already exist. Returns `1` if set, `0` if field already existed.
+
+### HINCRBY key field increment
+Increments the integer value of `field` by `increment`. Creates the field with value `0` before incrementing if it does not exist.
+```
+> HSET stats views 10
+(integer) 1
+> HINCRBY stats views 5
+(integer) 15
+```
+
+### HINCRBYFLOAT key field increment
+Increments the float value of `field` by `increment`. Accepts decimal and scientific notation.
+```
+> HINCRBYFLOAT stats ratio 1.5
+"1.5"
+> HINCRBYFLOAT stats ratio -0.3
+"1.2"
+```
+
 ---
 
 ## Sets
@@ -234,6 +322,160 @@ Removes members. Returns the number removed.
 
 ### SCARD key
 Returns the number of members.
+
+### SMOVE source destination member
+Atomically moves `member` from `source` to `destination`. Returns `1` on success, `0` if `member` is not in `source`.
+
+### SRANDMEMBER key [count]
+Returns a random member without removing it.
+- No `count` — returns one element (or `nil` if the set is empty).
+- `count >= 0` — returns up to `count` distinct elements.
+- `count < 0` — returns exactly `|count|` elements, possibly with repeats.
+
+### SPOP key [count]
+Removes and returns one or `count` random members.
+
+### SUNION key [key ...]
+Returns the union of all given sets.
+```
+> SADD s1 a b c
+> SADD s2 b c d
+> SUNION s1 s2
+1) "a"
+2) "b"
+3) "c"
+4) "d"
+```
+
+### SINTER key [key ...]
+Returns the intersection of all given sets.
+```
+> SINTER s1 s2
+1) "b"
+2) "c"
+```
+
+### SDIFF key [key ...]
+Returns the difference: members of the first key that are not in any subsequent key.
+```
+> SDIFF s1 s2
+1) "a"
+```
+
+### SUNIONSTORE destination key [key ...]
+Stores the union result in `destination`. Returns the number of members stored.
+
+### SINTERSTORE destination key [key ...]
+Stores the intersection result in `destination`.
+
+### SDIFFSTORE destination key [key ...]
+Stores the difference result in `destination`.
+
+---
+
+## Sorted Sets
+
+Sorted sets store unique members each associated with a floating-point score. Members are ordered by score; ties are broken lexicographically by member bytes.
+
+**Score bounds** (for range commands): use `-inf` and `+inf` for unbounded ranges; prefix with `(` for an exclusive bound (e.g. `(1.0` means score > 1.0).
+
+### ZADD key [NX|XX] [GT|LT] [CH] score member [score member ...]
+Adds or updates members with the given scores. Returns the number of new members added (or, with `CH`, the number of members added or changed).
+
+Flags:
+- `NX` — only add new members, never update existing ones.
+- `XX` — only update existing members, never add new ones.
+- `GT` — only update if the new score is greater than the current score.
+- `LT` — only update if the new score is less than the current score.
+- `CH` — change return value to count of added + changed members.
+
+```
+> ZADD leaderboard 100 alice 200 bob 150 carol
+(integer) 3
+> ZADD leaderboard GT 250 alice
+(integer) 0
+> ZSCORE leaderboard alice
+"250"
+```
+
+### ZSCORE key member
+Returns the score of `member` as a bulk string, or `(nil)` if the member does not exist.
+
+### ZRANK key member
+Returns the 0-based rank of `member` (lowest score = rank 0), or `(nil)` if not found.
+
+### ZREVRANK key member
+Returns the rank with highest score = rank 0.
+
+### ZCARD key
+Returns the number of members.
+
+### ZCOUNT key min max
+Returns the number of members with scores in `[min, max]`. Supports `(` prefix and `±inf`.
+```
+> ZCOUNT leaderboard 100 200
+(integer) 2
+> ZCOUNT leaderboard (100 +inf
+(integer) 2
+```
+
+### ZINCRBY key increment member
+Increments the score of `member` by `increment`. Returns the new score as a bulk string.
+
+### ZREM key member [member ...]
+Removes members. Returns the number of members removed.
+
+### ZRANGE key start stop [WITHSCORES]
+Returns members with ranks in `[start, stop]` (lowest score first). Negative indices are allowed (`-1` = highest rank).
+```
+> ZRANGE leaderboard 0 -1 WITHSCORES
+1) "carol"
+2) "150"
+3) "bob"
+4) "200"
+5) "alice"
+6) "250"
+```
+
+### ZREVRANGE key start stop [WITHSCORES]
+Same as `ZRANGE` but in descending order (highest score first).
+
+### ZRANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+Returns members whose scores fall within `[min, max]`, in ascending score order.
+```
+> ZRANGEBYSCORE leaderboard 100 200 WITHSCORES LIMIT 0 2
+1) "carol"
+2) "150"
+3) "bob"
+4) "200"
+```
+
+### ZREVRANGEBYSCORE key max min [WITHSCORES] [LIMIT offset count]
+Same but in descending order. Note: `max` comes before `min`.
+```
+> ZREVRANGEBYSCORE leaderboard +inf 150
+1) "alice"
+2) "bob"
+3) "carol"
+```
+
+### ZPOPMIN key [count]
+Removes and returns up to `count` members with the lowest scores (default 1). Returns alternating member/score pairs.
+
+### ZPOPMAX key [count]
+Removes and returns up to `count` members with the highest scores.
+
+### ZREMRANGEBYRANK key start stop
+Removes all members with ranks in `[start, stop]`. Returns the number removed.
+
+### ZREMRANGEBYSCORE key min max
+Removes all members with scores in `[min, max]`. Returns the number removed.
+```
+> ZREMRANGEBYSCORE leaderboard -inf 149
+(integer) 0
+> ZREMRANGEBYSCORE leaderboard 100 200
+(integer) 2
+```
 
 ---
 

@@ -346,27 +346,37 @@ pub fn build_value_frame(key: &str, value: &Value, pttl: i64) -> Frame {
             }
             Frame::Array(Some(cmd))
         }
-        Value::List(items) => Frame::Array(Some(
+        Value::List(list) => Frame::Array(Some(
             std::iter::once(Frame::bulk_str("RPUSH"))
                 .chain(std::iter::once(Frame::bulk_str(key)))
-                .chain(items.iter().map(|b| Frame::Bulk(Some(b.clone()))))
+                .chain(list.to_vec().into_iter().map(|b| Frame::Bulk(Some(b))))
                 .collect(),
         )),
         Value::Hash(map) => Frame::Array(Some(
             std::iter::once(Frame::bulk_str("HSET"))
                 .chain(std::iter::once(Frame::bulk_str(key)))
                 .chain(
-                    map.iter()
-                        .flat_map(|(f, v)| [Frame::Bulk(Some(f.clone())), Frame::Bulk(Some(v.clone()))]),
+                    map.all_pairs()
+                        .into_iter()
+                        .flat_map(|(f, v)| [Frame::Bulk(Some(f)), Frame::Bulk(Some(v))]),
                 )
                 .collect(),
         )),
         Value::Set(members) => Frame::Array(Some(
             std::iter::once(Frame::bulk_str("SADD"))
                 .chain(std::iter::once(Frame::bulk_str(key)))
-                .chain(members.iter().map(|b| Frame::Bulk(Some(b.clone()))))
+                .chain(members.members().into_iter().map(|b| Frame::Bulk(Some(b))))
                 .collect(),
         )),
+        Value::ZSet(z) => {
+            let pairs = z.all_with_scores();
+            let mut args: Vec<Frame> = vec![Frame::bulk_str("ZADD"), Frame::bulk_str(key)];
+            for (member, score) in pairs {
+                args.push(Frame::bulk_str(format!("{score}")));
+                args.push(Frame::Bulk(Some(member)));
+            }
+            Frame::Array(Some(args))
+        }
     }
 }
 
@@ -466,9 +476,14 @@ pub fn command_slot(cmd: &str, args: &[Frame]) -> CommandSlot {
         | "INCR" | "INCRBY" | "DECR" | "DECRBY"
         | "TYPE" | "EXPIRE" | "PEXPIRE" | "TTL" | "PTTL" | "PERSIST"
         | "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LLEN" | "LRANGE" | "LINDEX"
+        | "LSET" | "LINSERT" | "LREM" | "LTRIM"
         | "HSET" | "HMSET" | "HGET" | "HMGET" | "HGETALL" | "HDEL"
-        | "HLEN" | "HEXISTS" | "HKEYS" | "HVALS"
-        | "SADD" | "SMEMBERS" | "SISMEMBER" | "SREM" | "SCARD" => {
+        | "HLEN" | "HEXISTS" | "HKEYS" | "HVALS" | "HSETNX" | "HINCRBY" | "HINCRBYFLOAT"
+        | "SADD" | "SMEMBERS" | "SISMEMBER" | "SREM" | "SCARD" | "SRANDMEMBER" | "SPOP"
+        | "ZADD" | "ZSCORE" | "ZRANK" | "ZREVRANK" | "ZCARD" | "ZCOUNT"
+        | "ZINCRBY" | "ZREM" | "ZRANGE" | "ZREVRANGE"
+        | "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE"
+        | "ZPOPMIN" | "ZPOPMAX" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" => {
             single_key_slot(args, 1)
         }
 
