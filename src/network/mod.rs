@@ -10,7 +10,7 @@ use crate::commands::{execute, CommandContext};
 use crate::consensus::Raft;
 use crate::observability::Metrics;
 use crate::persistence::Aof;
-use crate::protocol::{parse_frame, serialize_frame, Frame};
+use crate::protocol::{parse_frame, write_frame_into, Frame};
 use crate::replication::{snapshot_entry_to_resp, Replication};
 use crate::storage::Store;
 
@@ -69,6 +69,9 @@ impl Server {
             let metrics = metrics.clone();
 
             tokio::spawn(async move {
+                // Disable Nagle — crucial for request/response latency.
+                let _ = socket.set_nodelay(true);
+
                 metrics.conn_open();
                 let ctx = CommandContext {
                     store: store.clone(),
@@ -98,7 +101,11 @@ async fn handle_connection(
     store: Arc<Store>,
     repl: Arc<Replication>,
 ) -> anyhow::Result<()> {
-    let mut buf = BytesMut::with_capacity(8 * 1024);
+    // 32 KB read buffer — reduces read(2) syscalls under pipelined workloads.
+    let mut buf = BytesMut::with_capacity(32 * 1024);
+    // Accumulate all serialised responses for one read burst, then flush once.
+    // This reduces write(2) syscalls from N (one per command) to 1 per batch.
+    let mut out = BytesMut::with_capacity(32 * 1024);
 
     loop {
         let n = socket.read_buf(&mut buf).await?;
@@ -111,25 +118,35 @@ async fn handle_connection(
                 Ok(Some((frame, consumed))) => {
                     let _ = buf.split_to(consumed);
 
-                    // Intercept SYNC at the network layer before command dispatch.
+                    // SYNC is handled at the network layer; flush pending
+                    // responses before switching the connection to streaming mode.
                     if is_sync_command(&frame) {
+                        if !out.is_empty() {
+                            socket.write_all(&out).await?;
+                            out.clear();
+                        }
                         info!("New replica connected, starting full-sync");
                         handle_replica_sync(socket, store, repl).await?;
                         return Ok(());
                     }
 
                     let response = execute(frame, &ctx).await;
-                    let bytes = serialize_frame(&response);
-                    socket.write_all(&bytes).await?;
+                    // Serialise directly into the accumulator — no per-response alloc.
+                    write_frame_into(&mut out, &response);
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    let err = serialize_frame(&Frame::error(format!("ERR protocol error: {e}")));
-                    socket.write_all(&err).await?;
+                    write_frame_into(&mut out, &Frame::error(format!("ERR protocol error: {e}")));
                     buf.clear();
                     break;
                 }
             }
+        }
+
+        // One syscall for the entire pipeline batch.
+        if !out.is_empty() {
+            socket.write_all(&out).await?;
+            out.clear();
         }
     }
 }

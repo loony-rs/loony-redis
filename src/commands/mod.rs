@@ -53,14 +53,23 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
         _ => return Frame::error("ERR invalid command format"),
     };
 
-    let cmd = match bulk_bytes(&args, 0) {
-        Some(b) => b,
-        None => return Frame::error("ERR invalid command name"),
+    // Uppercase the command name into a stack buffer — no heap allocation.
+    // All Redis command names are ASCII and fit within 32 bytes.
+    let mut upper_buf = [0u8; 32];
+    let cmd_str: &str = {
+        let cmd = match bulk_bytes(&args, 0) {
+            Some(b) => b,
+            None    => return Frame::error("ERR invalid command name"),
+        };
+        let n = cmd.len().min(32);
+        for (i, &b) in cmd.iter().take(32).enumerate() {
+            upper_buf[i] = b.to_ascii_uppercase();
+        }
+        std::str::from_utf8(&upper_buf[..n]).unwrap_or("")
     };
-    let cmd_str = String::from_utf8_lossy(&cmd).to_uppercase();
 
     // ── Raft path: route writes through consensus ─────────────────────────
-    if is_write(&cmd_str) && !ctx.is_replica_replay {
+    if is_write(cmd_str) && !ctx.is_replica_replay {
         if let Some(raft) = &ctx.raft {
             if !raft.is_leader.load(std::sync::atomic::Ordering::Acquire) {
                 let leader = raft.current_leader().await.unwrap_or_default();
@@ -107,15 +116,15 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
         );
     }
 
-    let response = dispatch(&cmd_str, &args, ctx).await;
+    let response = dispatch(cmd_str, &args, ctx).await;
 
     // Record metrics for every command (skipped during replica replay).
     if let Some(m) = &ctx.metrics {
-        m.record_cmd(&cmd_str, matches!(&response, Frame::Error(_)));
+        m.record_cmd(cmd_str, matches!(&response, Frame::Error(_)));
     }
 
     // Broadcast successful writes to connected replicas.
-    if is_write(&cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader && ctx.raft.is_none() {
+    if is_write(cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader && ctx.raft.is_none() {
         if !matches!(&response, Frame::Error(_)) {
             let cmd_bytes = serialize_frame(&Frame::Array(Some(args)));
             ctx.repl.broadcast(cmd_bytes);

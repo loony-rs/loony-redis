@@ -3,9 +3,17 @@ name = "loony-redis"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "loony_redis"
+path = "src/lib.rs"
+
 [[bin]]
 name = "loony-redis"
 path = "src/main.rs"
+
+[[bench]]
+name = "throughput"
+harness = false
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -17,6 +25,8 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
+itoa = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }

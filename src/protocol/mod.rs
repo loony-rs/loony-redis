@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::io::Cursor;
 
 /// A RESP2 value that can be sent or received over the wire.
@@ -61,7 +61,6 @@ enum ParseError {
 
 /// Try to decode one RESP frame from `buf`.
 /// Returns `(frame, bytes_consumed)` or `None` if the buffer is incomplete.
-/// Returns `Err` on a protocol violation.
 pub fn parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
     let mut cursor = Cursor::new(buf);
     match parse_value(&mut cursor) {
@@ -71,7 +70,7 @@ pub fn parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, String> {
     }
 }
 
-fn parse_value(cur: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
+fn parse_value<'a>(cur: &mut Cursor<&'a [u8]>) -> Result<Frame, ParseError> {
     if !cur.has_remaining() {
         return Err(ParseError::Incomplete);
     }
@@ -82,29 +81,22 @@ fn parse_value(cur: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
     match first {
         b'+' => {
             let line = read_line(cur)?;
-            Ok(Frame::SimpleString(
-                String::from_utf8_lossy(&line).into_owned(),
-            ))
+            Ok(Frame::SimpleString(String::from_utf8_lossy(line).into_owned()))
         }
         b'-' => {
             let line = read_line(cur)?;
-            Ok(Frame::Error(String::from_utf8_lossy(&line).into_owned()))
+            Ok(Frame::Error(String::from_utf8_lossy(line).into_owned()))
         }
         b':' => {
             let line = read_line(cur)?;
-            let s = String::from_utf8_lossy(&line);
-            s.trim()
-                .parse::<i64>()
+            parse_int(line)
                 .map(Frame::Integer)
-                .map_err(|_| ParseError::Invalid(format!("invalid integer: {s}")))
+                .ok_or_else(|| ParseError::Invalid(format!("invalid integer: {:?}", line)))
         }
         b'$' => {
             let line = read_line(cur)?;
-            let s = String::from_utf8_lossy(&line);
-            let len: i64 = s
-                .trim()
-                .parse()
-                .map_err(|_| ParseError::Invalid(format!("invalid bulk length: {s}")))?;
+            let len: i64 = parse_int(line)
+                .ok_or_else(|| ParseError::Invalid(format!("invalid bulk length: {:?}", line)))?;
             if len == -1 {
                 return Ok(Frame::Bulk(None));
             }
@@ -112,21 +104,19 @@ fn parse_value(cur: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
                 return Err(ParseError::Invalid(format!("invalid bulk length: {len}")));
             }
             let len = len as usize;
-            // Need len bytes + trailing \r\n
             if cur.remaining() < len + 2 {
                 return Err(ParseError::Incomplete);
             }
+            // Copy bulk body into an owned Bytes — the caller's BytesMut buffer is
+            // split_to'd immediately after, so a reference into it would be unsound.
             let data = Bytes::copy_from_slice(&cur.chunk()[..len]);
             cur.advance(len + 2);
             Ok(Frame::Bulk(Some(data)))
         }
         b'*' => {
             let line = read_line(cur)?;
-            let s = String::from_utf8_lossy(&line);
-            let count: i64 = s
-                .trim()
-                .parse()
-                .map_err(|_| ParseError::Invalid(format!("invalid array count: {s}")))?;
+            let count: i64 = parse_int(line)
+                .ok_or_else(|| ParseError::Invalid(format!("invalid array count: {:?}", line)))?;
             if count == -1 {
                 return Ok(Frame::Array(None));
             }
@@ -140,11 +130,11 @@ fn parse_value(cur: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
             Ok(Frame::Array(Some(items)))
         }
         _ => {
-            // Inline command: back up 1 byte and consume until \r\n or \n.
+            // Inline command — back up one byte and consume until \r\n or \n.
             let pos = cur.position();
             cur.set_position(pos - 1);
             let line = read_line(cur)?;
-            let s = String::from_utf8_lossy(&line);
+            let s = std::str::from_utf8(line).unwrap_or("");
             let parts: Vec<Frame> = s
                 .split_whitespace()
                 .map(|p| Frame::Bulk(Some(Bytes::copy_from_slice(p.as_bytes()))))
@@ -154,49 +144,86 @@ fn parse_value(cur: &mut Cursor<&[u8]>) -> Result<Frame, ParseError> {
     }
 }
 
-/// Read bytes up to (and consuming) the next `\r\n`. Returns the bytes before `\r\n`.
-fn read_line(cur: &mut Cursor<&[u8]>) -> Result<Vec<u8>, ParseError> {
-    let data = cur.chunk();
-    // data.len() must be >= 2 for there to be a \r\n
-    let limit = data.len().saturating_sub(1);
+/// Read bytes up to (and consuming) the next `\r\n`.
+/// Returns a zero-copy slice of the input buffer — no allocation.
+fn read_line<'a>(cur: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], ParseError> {
+    let start = cur.position() as usize;
+    // SAFETY: get_ref() returns &&'a [u8]; deref gives &'a [u8].
+    let data: &'a [u8] = *cur.get_ref();
+    let remaining = &data[start..];
+
+    let limit = remaining.len().saturating_sub(1);
     for i in 0..limit {
-        if data[i] == b'\r' && data[i + 1] == b'\n' {
-            let line = data[..i].to_vec();
-            cur.advance(i + 2);
-            return Ok(line);
+        if remaining[i] == b'\r' && remaining[i + 1] == b'\n' {
+            // Advance cursor past the line and \r\n.
+            cur.set_position((start + i + 2) as u64);
+            return Ok(&remaining[..i]);
         }
     }
     Err(ParseError::Incomplete)
 }
 
+/// Parse an ASCII decimal integer from bytes without allocating.
+#[inline]
+fn parse_int(b: &[u8]) -> Option<i64> {
+    std::str::from_utf8(b).ok()?.trim().parse().ok()
+}
+
 // ── Serializer ─────────────────────────────────────────────────────────────
 
+/// Serialise `frame` into a fresh `Bytes`.  Pre-sizes the buffer to avoid
+/// reallocation for the common small-response cases.
 pub fn serialize_frame(frame: &Frame) -> Bytes {
-    let mut buf = BytesMut::new();
+    let cap = capacity_hint(frame);
+    let mut buf = BytesMut::with_capacity(cap);
     write_frame(&mut buf, frame);
     buf.freeze()
+}
+
+/// Write `frame` directly into `buf` — used for pipeline response batching so
+/// multiple responses can be flushed to the socket in a single syscall.
+pub fn write_frame_into(buf: &mut BytesMut, frame: &Frame) {
+    write_frame(buf, frame);
+}
+
+fn capacity_hint(frame: &Frame) -> usize {
+    match frame {
+        Frame::SimpleString(s) => s.len() + 3,
+        Frame::Error(s)        => s.len() + 3,
+        Frame::Integer(_)      => 24,
+        Frame::Bulk(None)      => 5,
+        Frame::Bulk(Some(b))   => b.len() + 16,
+        Frame::Array(None)     => 5,
+        Frame::Array(Some(v))  => 8 + v.iter().map(capacity_hint).sum::<usize>(),
+    }
 }
 
 fn write_frame(buf: &mut BytesMut, frame: &Frame) {
     match frame {
         Frame::SimpleString(s) => {
-            buf.extend_from_slice(b"+");
+            buf.put_u8(b'+');
             buf.extend_from_slice(s.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
         Frame::Error(s) => {
-            buf.extend_from_slice(b"-");
+            buf.put_u8(b'-');
             buf.extend_from_slice(s.as_bytes());
             buf.extend_from_slice(b"\r\n");
         }
         Frame::Integer(n) => {
-            buf.extend_from_slice(format!(":{n}\r\n").as_bytes());
+            buf.put_u8(b':');
+            let mut tmp = itoa::Buffer::new();
+            buf.extend_from_slice(tmp.format(*n).as_bytes());
+            buf.extend_from_slice(b"\r\n");
         }
         Frame::Bulk(None) => {
             buf.extend_from_slice(b"$-1\r\n");
         }
         Frame::Bulk(Some(data)) => {
-            buf.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
+            buf.put_u8(b'$');
+            let mut tmp = itoa::Buffer::new();
+            buf.extend_from_slice(tmp.format(data.len()).as_bytes());
+            buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(data);
             buf.extend_from_slice(b"\r\n");
         }
@@ -204,7 +231,10 @@ fn write_frame(buf: &mut BytesMut, frame: &Frame) {
             buf.extend_from_slice(b"*-1\r\n");
         }
         Frame::Array(Some(items)) => {
-            buf.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            buf.put_u8(b'*');
+            let mut tmp = itoa::Buffer::new();
+            buf.extend_from_slice(tmp.format(items.len()).as_bytes());
+            buf.extend_from_slice(b"\r\n");
             for item in items {
                 write_frame(buf, item);
             }
@@ -304,10 +334,9 @@ mod tests {
 
     #[test]
     fn test_multi_frame_buffer() {
-        // Two frames concatenated — parser should consume the first and leave the rest.
         let data = b"+OK\r\n+PONG\r\n";
         let (_, consumed) = parse_frame(data).unwrap().unwrap();
-        assert_eq!(consumed, 5); // "+OK\r\n"
+        assert_eq!(consumed, 5);
         let (f2, _) = parse_frame(&data[consumed..]).unwrap().unwrap();
         assert!(matches!(f2, Frame::SimpleString(s) if s == "PONG"));
     }
