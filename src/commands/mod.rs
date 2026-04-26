@@ -1,23 +1,27 @@
 use bytes::Bytes;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::cluster::{command_slot, CommandSlot, NodeState, SharedCluster, SharedHealth};
+use crate::cluster::{command_slot, node_id_of, CommandSlot, NodeState, SharedCluster, SharedHealth};
 use crate::consensus::Raft;
+use crate::observability::Metrics;
 use crate::persistence::Aof;
 use crate::protocol::{serialize_frame, Frame};
 use crate::replication::Replication;
 use crate::storage::{ScoreBound, Store, Value};
 
 pub struct CommandContext {
-    pub store: Arc<Store>,
-    pub aof: Option<Arc<Aof>>,
-    pub repl: Arc<Replication>,
+    pub store:   Arc<Store>,
+    pub aof:     Option<Arc<Aof>>,
+    pub repl:    Arc<Replication>,
     /// Raft handle, present when consensus-based replication is active.
-    pub raft: Option<Arc<Raft>>,
+    pub raft:    Option<Arc<Raft>>,
     /// Cluster config, present when slot-based sharding is active.
     pub cluster: Option<SharedCluster>,
     /// Node health table, present when cluster heartbeat is active.
-    pub health: Option<SharedHealth>,
+    pub health:  Option<SharedHealth>,
+    /// Metrics collector, absent during replica replay.
+    pub metrics: Option<Arc<Metrics>>,
     /// True when replaying commands received from the leader or from the Raft
     /// log. Skips READONLY checks and suppresses re-broadcasting/re-logging.
     pub is_replica_replay: bool,
@@ -105,6 +109,11 @@ pub async fn execute(frame: Frame, ctx: &CommandContext) -> Frame {
 
     let response = dispatch(&cmd_str, &args, ctx).await;
 
+    // Record metrics for every command (skipped during replica replay).
+    if let Some(m) = &ctx.metrics {
+        m.record_cmd(&cmd_str, matches!(&response, Frame::Error(_)));
+    }
+
     // Broadcast successful writes to connected replicas.
     if is_write(&cmd_str) && !ctx.is_replica_replay && ctx.repl.is_leader && ctx.raft.is_none() {
         if !matches!(&response, Frame::Error(_)) {
@@ -128,6 +137,8 @@ async fn dispatch(cmd_str: &str, args: &[Frame], ctx: &CommandContext) -> Frame 
         "CONFIG" => Frame::empty_array(),
         "CLUSTER" => cmd_cluster(&args, ctx).await,
         "MIGRATE" => cmd_migrate(&args, ctx).await,
+        "INFO"  => cmd_info(&args, ctx).await,
+        "DEBUG" => cmd_debug(&args, ctx).await,
 
         // ── Keyspace ──────────────────────────────────────────────────────
         "DEL" => cmd_del(&args, ctx).await,
@@ -1809,5 +1820,161 @@ fn cmd_zremrangebyscore(args: &[Frame], ctx: &CommandContext) -> Frame {
     match ctx.store.zremrangebyscore(&key, min, max) {
         Ok(n)  => Frame::integer(n as i64),
         Err(e) => Frame::error(e.to_string()),
+    }
+}
+
+// ── INFO ──────────────────────────────────────────────────────────────────
+
+async fn cmd_info(args: &[Frame], ctx: &CommandContext) -> Frame {
+    let section = bulk_as_str(args, 1)
+        .map(|s| s.to_uppercase())
+        .unwrap_or_else(|| "ALL".to_string());
+
+    let want = |name: &str| section == "ALL" || section == "DEFAULT" || section == name;
+
+    let mut out = String::with_capacity(1024);
+
+    // ── Server ────────────────────────────────────────────────────────────
+    if want("SERVER") {
+        out.push_str("# Server\r\n");
+        out.push_str("redis_version:7.0.0-loony\r\n");
+        if let Some(m) = &ctx.metrics {
+            out.push_str(&format!("tcp_port:{}\r\n", m.port));
+            out.push_str(&format!("uptime_in_seconds:{}\r\n", m.uptime_secs()));
+            out.push_str(&format!("uptime_in_days:{}\r\n", m.uptime_secs() / 86400));
+        }
+        out.push_str("os:Linux\r\n");
+        out.push_str("arch_bits:64\r\n");
+        out.push_str("executable:loony-redis\r\n");
+        out.push_str("\r\n");
+    }
+
+    // ── Stats ─────────────────────────────────────────────────────────────
+    if want("STATS") {
+        out.push_str("# Stats\r\n");
+        if let Some(m) = &ctx.metrics {
+            out.push_str(&format!("total_commands_processed:{}\r\n", m.total_commands()));
+            out.push_str(&format!("total_connections_received:{}\r\n", m.total_connections()));
+            out.push_str(&format!("connected_clients:{}\r\n", m.active_connections()));
+        }
+        out.push_str("\r\n");
+    }
+
+    // ── Replication ───────────────────────────────────────────────────────
+    if want("REPLICATION") {
+        out.push_str("# Replication\r\n");
+        out.push_str(if ctx.repl.is_leader { "role:master\r\n" } else { "role:replica\r\n" });
+        if let Some(ref addr) = ctx.repl.leader_addr {
+            let host = addr.split(':').next().unwrap_or("");
+            let port = addr.split(':').nth(1).unwrap_or("0");
+            out.push_str(&format!("master_host:{host}\r\n"));
+            out.push_str(&format!("master_port:{port}\r\n"));
+        }
+        out.push_str(&format!(
+            "master_repl_offset:{}\r\n",
+            ctx.repl.commit_count.load(Ordering::Relaxed)
+        ));
+        out.push_str("\r\n");
+    }
+
+    // ── Cluster ───────────────────────────────────────────────────────────
+    if want("CLUSTER") {
+        out.push_str("# Cluster\r\n");
+        if let Some(ref c) = ctx.cluster {
+            let state = c.read().await;
+            out.push_str("cluster_enabled:1\r\n");
+            out.push_str(&format!("cluster_my_id:{}\r\n", node_id_of(state.config.my_addr())));
+            out.push_str(&format!("cluster_known_nodes:{}\r\n", state.config.nodes.len()));
+            let slots_owned: u32 = state.config
+                .slot_ranges_for(state.config.my_index)
+                .iter()
+                .map(|(s, e)| (e - s + 1) as u32)
+                .sum();
+            out.push_str(&format!("cluster_slots_owned:{slots_owned}\r\n"));
+        } else {
+            out.push_str("cluster_enabled:0\r\n");
+        }
+        out.push_str("\r\n");
+    }
+
+    // ── Keyspace ──────────────────────────────────────────────────────────
+    if want("KEYSPACE") {
+        out.push_str("# Keyspace\r\n");
+        let (total, expires) = ctx.store.keyspace_info();
+        if total > 0 {
+            out.push_str(&format!("db0:keys={total},expires={expires},avg_ttl=0\r\n"));
+        }
+        out.push_str("\r\n");
+    }
+
+    Frame::Bulk(Some(Bytes::from(out.into_bytes())))
+}
+
+// ── DEBUG ─────────────────────────────────────────────────────────────────
+
+async fn cmd_debug(args: &[Frame], ctx: &CommandContext) -> Frame {
+    let sub = match bulk_as_str(args, 1).map(|s| s.to_uppercase()) {
+        Some(s) => s,
+        None    => return Frame::error("ERR wrong number of arguments for 'debug' command"),
+    };
+
+    match sub.as_str() {
+        "SLEEP" => {
+            let secs = bulk_as_str(args, 2)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            tokio::time::sleep(std::time::Duration::from_secs_f64(secs)).await;
+            Frame::ok()
+        }
+
+        "OBJECT" => {
+            let key = match bulk_as_str(args, 2) {
+                Some(k) => k,
+                None    => return Frame::error("ERR syntax error"),
+            };
+            match ctx.store.debug_object(&key) {
+                Some(info) => Frame::Bulk(Some(Bytes::from(info.into_bytes()))),
+                None       => Frame::error("ERR no such key"),
+            }
+        }
+
+        // Cluster routing-table dump — useful for live inspection
+        "CLUSTER" => {
+            if let Some(ref c) = ctx.cluster {
+                let state = c.read().await;
+                let mut s = String::new();
+                for (i, node) in state.config.nodes.iter().enumerate() {
+                    let ranges = state.config.slot_ranges_for(i);
+                    let range_str = ranges.iter()
+                        .map(|(a, b)| format!("{a}-{b}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let marker = if i == state.config.my_index { " *" } else { "" };
+                    s.push_str(&format!("{node}{marker} slots:[{range_str}]\n"));
+                }
+                Frame::Bulk(Some(Bytes::from(s.into_bytes())))
+            } else {
+                Frame::Bulk(Some(Bytes::from_static(b"cluster not enabled")))
+            }
+        }
+
+        // Health-table dump with missed counts and last-seen timestamps
+        "HEALTH" => {
+            if let Some(ref h) = ctx.health {
+                let peers = h.snapshot().await;
+                let mut s = String::new();
+                for (addr, state) in &peers {
+                    s.push_str(&format!("{addr} {}\n", state.as_str()));
+                }
+                if s.is_empty() { s.push_str("no peers\n"); }
+                Frame::Bulk(Some(Bytes::from(s.into_bytes())))
+            } else {
+                Frame::Bulk(Some(Bytes::from_static(b"cluster not enabled")))
+            }
+        }
+
+        "RELOAD" | "LOADAOF" | "JMAP" => Frame::ok(),
+
+        _ => Frame::error(format!("ERR unknown debug sub-command '{sub}'")),
     }
 }

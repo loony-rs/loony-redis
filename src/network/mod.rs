@@ -8,44 +8,48 @@ use tracing::{debug, error, info, warn};
 use crate::cluster::{run_heartbeat_task, SharedCluster, SharedHealth};
 use crate::commands::{execute, CommandContext};
 use crate::consensus::Raft;
+use crate::observability::Metrics;
 use crate::persistence::Aof;
 use crate::protocol::{parse_frame, serialize_frame, Frame};
 use crate::replication::{snapshot_entry_to_resp, Replication};
 use crate::storage::Store;
 
 pub struct Server {
-    store: Arc<Store>,
-    aof: Option<Arc<Aof>>,
-    repl: Arc<Replication>,
-    raft: Option<Arc<Raft>>,
+    store:   Arc<Store>,
+    aof:     Option<Arc<Aof>>,
+    repl:    Arc<Replication>,
+    raft:    Option<Arc<Raft>>,
     cluster: Option<SharedCluster>,
-    health: Option<SharedHealth>,
+    health:  Option<SharedHealth>,
     my_addr: Option<String>,
+    metrics: Arc<Metrics>,
 }
 
 impl Server {
     pub fn new(
-        store: Arc<Store>,
-        aof: Option<Arc<Aof>>,
-        repl: Arc<Replication>,
-        raft: Option<Arc<Raft>>,
+        store:   Arc<Store>,
+        aof:     Option<Arc<Aof>>,
+        repl:    Arc<Replication>,
+        raft:    Option<Arc<Raft>>,
         cluster: Option<SharedCluster>,
-        health: Option<SharedHealth>,
+        health:  Option<SharedHealth>,
         my_addr: Option<String>,
+        metrics: Arc<Metrics>,
     ) -> Self {
-        Server { store, aof, repl, raft, cluster, health, my_addr }
+        Server { store, aof, repl, raft, cluster, health, my_addr, metrics }
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
         let listener = TcpListener::bind(addr).await?;
         info!("loony-redis listening on {addr}");
 
-        let store = self.store;
-        let aof = self.aof;
-        let repl = self.repl;
-        let raft = self.raft;
+        let store   = self.store;
+        let aof     = self.aof;
+        let repl    = self.repl;
+        let raft    = self.raft;
         let cluster = self.cluster;
-        let health = self.health;
+        let health  = self.health;
+        let metrics = self.metrics;
 
         // Spawn heartbeat task when cluster + health are both active.
         if let (Some(c), Some(h), Some(my)) = (cluster.clone(), health.clone(), self.my_addr) {
@@ -56,14 +60,16 @@ impl Server {
             let (socket, peer) = listener.accept().await?;
             debug!("new connection from {peer}");
 
-            let store = store.clone();
-            let aof = aof.clone();
-            let repl = repl.clone();
-            let raft = raft.clone();
+            let store   = store.clone();
+            let aof     = aof.clone();
+            let repl    = repl.clone();
+            let raft    = raft.clone();
             let cluster = cluster.clone();
-            let health = health.clone();
+            let health  = health.clone();
+            let metrics = metrics.clone();
 
             tokio::spawn(async move {
+                metrics.conn_open();
                 let ctx = CommandContext {
                     store: store.clone(),
                     aof,
@@ -71,6 +77,7 @@ impl Server {
                     raft: raft.clone(),
                     cluster: cluster.clone(),
                     health,
+                    metrics: Some(metrics.clone()),
                     is_replica_replay: false,
                 };
                 if let Err(e) = handle_connection(socket, ctx, store, repl).await {
@@ -78,6 +85,7 @@ impl Server {
                         error!("connection {peer} error: {e}");
                     }
                 }
+                metrics.conn_close();
                 debug!("connection {peer} closed");
             });
         }
@@ -227,6 +235,7 @@ async fn replicate_from_leader(
                         raft: None,
                         cluster: None,
                         health: None,
+                        metrics: None,
                         is_replica_replay: true,
                     };
                     execute(frame, &ctx).await;

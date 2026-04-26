@@ -17,6 +17,7 @@ src/
   replication/     Async leader–follower replication
   consensus/       Raft consensus engine
   cluster/         Hash-slot sharding, routing, migration, health/gossip
+  observability/   Prometheus metrics, /health, /ready, INFO/DEBUG support
 ```
 
 ---
@@ -245,6 +246,78 @@ The secondary sort key (the member bytes) breaks ties when two members have equa
 
 ---
 
+## Phase 10 — Observability & Tooling
+
+**File:** `src/observability/mod.rs`
+
+### Metrics (Prometheus text format)
+
+A minimal HTTP server listens on `--metrics-addr` (default `127.0.0.1:9090`) and serves three endpoints:
+
+| Path | Purpose |
+|---|---|
+| `GET /metrics` | Prometheus text format (scrape target) |
+| `GET /health` | Always `200 {"status":"ok"}` — suitable for load-balancer checks |
+| `GET /ready` | `200` when no cluster peer is in `Failed` state; `503` otherwise |
+
+**Implementation note:** The Prometheus text format is hand-rolled (no external metrics crate). The HTTP server is a bare `tokio::net::TcpListener` that reads the request line and writes a response — HTTP/1.0 style, `Connection: close`. This keeps the dependency tree minimal and avoids pulling in `hyper` or `axum` for what amounts to a single-path read-only server.
+
+### Metrics exposed
+
+| Metric | Type | Description |
+|---|---|---|
+| `loony_uptime_seconds` | counter | Seconds since server start |
+| `loony_connections_active` | gauge | Live client connections right now |
+| `loony_connections_total` | counter | Total connections accepted since start |
+| `loony_commands_total{status}` | counter | Commands processed, labelled `ok` or `err` |
+| `loony_cmd_total{cmd,status}` | counter | Per-command breakdown |
+| `loony_keys_total` | gauge | Live keys in the store (lazy expiry means this counts only non-expired keys) |
+| `loony_keys_with_expiry_total` | gauge | Keys that have a TTL set |
+| `loony_replication_commits_total` | counter | Write commands committed on this node |
+| `loony_cluster_slots_owned` | gauge | Hash slots owned by this node |
+| `loony_cluster_nodes_total` | gauge | Number of nodes in the cluster |
+| `loony_peer_alive{peer}` | gauge | `1` if the peer's last known state is `Alive` |
+| `loony_peer_failed{peer}` | gauge | `1` if the peer is in `Failed` state |
+
+Connection tracking is done at the network layer: `conn_open()` increments both `connections_active` and `connections_total` when a task is spawned; `conn_close()` decrements `connections_active` when the task exits.
+
+Command recording happens after `dispatch()` returns — before broadcasting to replicas — so error responses from routing (CROSSSLOT, MOVED) are counted correctly.
+
+### INFO command
+
+`INFO [section]` returns a Redis-compatible bulk string. Sections:
+
+| Section | Contents |
+|---|---|
+| `server` | version, port, uptime |
+| `stats` | total commands, total connections, active connections |
+| `replication` | role, leader address, commit offset |
+| `cluster` | enabled flag, node ID, peer count, slots owned |
+| `keyspace` | `db0:keys=N,expires=M` (only if N > 0) |
+| `all` (default) | all sections combined |
+
+### DEBUG command
+
+`DEBUG` provides live introspection without restarting:
+
+| Subcommand | Purpose |
+|---|---|
+| `DEBUG OBJECT key` | Encoding info: type, encoding name (`embstr`/`listpack`/`quicklist`/`hashtable`/`skiplist`), serialized length, TTL remaining |
+| `DEBUG SLEEP n` | Pause the connection for `n` seconds (float); compatibility shim |
+| `DEBUG CLUSTER` | Dump the full slot→node routing table for every node in the cluster |
+| `DEBUG HEALTH` | Dump the peer health table (addr + state) |
+
+**`DEBUG CLUSTER` example:**
+```
+> DEBUG CLUSTER
+127.0.0.1:6479 * slots:[0-5460]
+127.0.0.1:6480   slots:[5461-10922]
+127.0.0.1:6481   slots:[10923-16383]
+```
+The `*` marks this node. Slot ranges are re-derived live from the `ClusterConfig`; the output reflects the post-MEET/FORGET state immediately.
+
+---
+
 ## What Is Not Implemented
 
 - **RDB snapshots** — AOF only.
@@ -253,4 +326,3 @@ The secondary sort key (the member bytes) breaks ties when two members have equa
 - **Pub/Sub** — not implemented.
 - **Transactions (MULTI/EXEC)** — not implemented.
 - **Replica promotion in cluster mode** — each shard is a single node; adding replication per shard is a future phase.
-- **Prometheus metrics** — Phase 10 (observability).

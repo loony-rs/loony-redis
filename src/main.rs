@@ -2,6 +2,7 @@ mod cluster;
 mod commands;
 mod consensus;
 mod network;
+mod observability;
 mod persistence;
 mod protocol;
 mod replication;
@@ -54,6 +55,16 @@ struct Args {
     /// This node's own address as it appears in --cluster-nodes
     #[arg(long)]
     cluster_self: Option<String>,
+
+    // ── Phase-10 observability ─────────────────────────────────────────────
+
+    /// Address for the Prometheus metrics + health HTTP server (default disabled)
+    #[arg(long, default_value = "127.0.0.1:9090")]
+    metrics_addr: String,
+
+    /// Disable the metrics HTTP server
+    #[arg(long, default_value_t = false)]
+    no_metrics: bool,
 }
 
 #[tokio::main]
@@ -65,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Phase-10: Metrics — initialise before anything else so uptime starts from t=0.
+    let metrics = observability::Metrics::new(args.host.clone(), args.port);
 
     let store = Arc::new(storage::Store::new());
 
@@ -88,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 raft: None,
                 cluster: None,
                 health: None,
+                metrics: None,
                 is_replica_replay: true,
             };
             for frame in frames {
@@ -125,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
                     raft: None,
                     cluster: None,
                     health: None,
+                    metrics: None,
                     is_replica_replay: true,
                 };
                 commands::execute(frame, &ctx).await
@@ -164,6 +180,18 @@ async fn main() -> anyhow::Result<()> {
         (None, None, None)
     };
 
+    // Phase-10: Start metrics HTTP server.
+    if !args.no_metrics {
+        observability::start_metrics_server(
+            args.metrics_addr.clone(),
+            metrics.clone(),
+            store.clone(),
+            repl.clone(),
+            cluster.clone(),
+            health.clone(),
+        );
+    }
+
     // Phase-4 follower loop (only without Raft).
     if raft.is_none() {
         if let Some(ref leader) = args.replicaof {
@@ -176,6 +204,6 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let server = network::Server::new(store, aof, repl, raft, cluster, health, cluster_self);
+    let server = network::Server::new(store, aof, repl, raft, cluster, health, cluster_self, metrics);
     server.run(&format!("{}:{}", args.host, args.port)).await
 }

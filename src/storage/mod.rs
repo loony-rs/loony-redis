@@ -139,6 +139,57 @@ impl Store {
 
     pub fn keys_count(&self) -> usize { self.data.len() }
 
+    /// Returns (total_live_keys, keys_with_expiry).
+    pub fn keyspace_info(&self) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut with_expiry = 0usize;
+        for e in self.data.iter() {
+            if !e.value().is_expired() {
+                total += 1;
+                if e.value().expires_at.is_some() {
+                    with_expiry += 1;
+                }
+            }
+        }
+        (total, with_expiry)
+    }
+
+    /// Returns a Redis-style DEBUG OBJECT string for `key`, or None if missing.
+    pub fn debug_object(&self, key: &str) -> Option<String> {
+        let e = self.data.get(key)?;
+        if e.is_expired() { return None; }
+
+        let (type_str, encoding, sz) = match &e.value {
+            Value::String(b) => {
+                let enc = if b.len() <= 44 { "embstr" } else { "raw" };
+                ("string", enc, b.len())
+            }
+            Value::List(l) => {
+                let enc = match l { list::List::Small(_) => "listpack", list::List::Large(_) => "quicklist" };
+                ("list", enc, l.len())
+            }
+            Value::Hash(h) => {
+                let enc = match h { hash::Hash::Small(_) => "listpack", hash::Hash::Large(_) => "hashtable" };
+                ("hash", enc, h.len())
+            }
+            Value::Set(s) => {
+                let enc = match s { set::Set::Small(_) => "listpack", set::Set::Large(_) => "hashtable" };
+                ("set", enc, s.len())
+            }
+            Value::ZSet(z) => ("zset", "skiplist", z.len()),
+        };
+
+        let idle = match e.expires_at {
+            Some(t) => t.saturating_duration_since(Instant::now()).as_secs(),
+            None    => 0,
+        };
+
+        Some(format!(
+            "Value at 0x0 refcount:1 encoding:{encoding} \
+             serializedlength:{sz} lru:0 lru_seconds_idle:{idle} type:{type_str}"
+        ))
+    }
+
     pub fn all_keys(&self) -> Vec<String> {
         self.data.iter()
             .filter(|e| !e.value().is_expired())

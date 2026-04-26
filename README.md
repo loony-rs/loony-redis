@@ -2,7 +2,7 @@
 
 A Redis-compatible, distributed, fault-tolerant in-memory key-value store written entirely in Rust.
 
-Built from scratch across 9 engineering phases — from a single-node KV engine to a fully distributed cluster with Raft consensus, dynamic membership, automatic fault recovery, and a complete Redis data-structure surface.
+Built from scratch across 10 engineering phases — from a single-node KV engine to a fully distributed cluster with Raft consensus, dynamic membership, automatic fault recovery, a complete Redis data-structure surface, and production-grade observability.
 
 ## Features
 
@@ -18,6 +18,7 @@ Built from scratch across 9 engineering phases — from a single-node KV engine 
 | **Dynamic membership** | `CLUSTER MEET` / `CLUSTER FORGET` with live data migration |
 | **Fault detection** | Heartbeat + gossip, automatic slot redistribution on failure |
 | **TTL** | Per-key expiry with `EX`, `PX`, `EXPIRE`, `PEXPIRE` |
+| **Observability** | Prometheus metrics, `/health`, `/ready` endpoints; `INFO` and `DEBUG` commands |
 
 ## Quick Start
 
@@ -100,6 +101,8 @@ Use `redis-cli -c -p 6479` (cluster mode) or any port — requests are transpare
 | `--peers` | _(disabled)_ | Comma-separated Raft peer addresses |
 | `--cluster-nodes` | _(disabled)_ | All cluster node addresses (comma-separated) |
 | `--cluster-self` | _(disabled)_ | This node's own address (must appear in `--cluster-nodes`) |
+| `--metrics-addr` | `127.0.0.1:9090` | Address for the Prometheus + health HTTP server |
+| `--no-metrics` | _(off)_ | Disable the metrics HTTP server |
 
 Logging verbosity is controlled by the `RUST_LOG` environment variable (default: `info`).
 
@@ -107,6 +110,9 @@ Logging verbosity is controlled by the `RUST_LOG` environment variable (default:
 
 ### Connection
 `PING`, `ECHO`, `QUIT`, `SELECT`, `CLIENT`, `COMMAND`, `CONFIG`
+
+### Observability
+`INFO` _(server / stats / replication / cluster / keyspace / all)_, `DEBUG` _(object / sleep / cluster / health)_
 
 ### Keyspace
 `DEL`, `EXISTS`, `TYPE`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `PERSIST`, `KEYS`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`
@@ -186,6 +192,7 @@ src/
   replication/       Leader broadcast channel, follower sync loop
   consensus/         Raft state machine, leader election, log replication
   cluster/           Hash slots, routing, migration, heartbeat, gossip
+  observability/     Metrics (Prometheus), /health, /ready endpoints
 docs/
   Architecture.md    Deep-dive design and trade-off notes
   ClusterGuide.md    Cluster operations: meet, forget, health, fault recovery
@@ -203,3 +210,5 @@ scripts/
 - **Transparent proxying** — ordinary `redis-cli` works against any shard without `MOVED` handling.
 - **Gossip is pessimistic** — node state only moves toward `Failed` via gossip; recovery requires a direct successful heartbeat.
 - **Ordering invariant in FORGET** — routing tables are updated on all surviving nodes *before* triggering the departing node's drain, preventing proxy loops.
+- **Zero-dependency metrics** — Prometheus text format is emitted by a hand-rolled HTTP listener (tokio + std atomics + DashMap); no heavy observability crate is added to the dependency tree.
+- **DEBUG as a live wire** — `DEBUG CLUSTER` and `DEBUG HEALTH` dump the in-memory routing table and peer health table at any moment without restarting the node.
