@@ -2,8 +2,8 @@ use bytes::Bytes;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::broadcast;
 
-use crate::protocol::{serialize_frame, Frame};
-use crate::storage::SnapshotEntry;
+use protocol::{serialize_frame, Frame};
+use storage::SnapshotEntry;
 
 /// Maximum number of write-command bytes buffered for each lagging replica.
 const BROADCAST_CAPACITY: usize = 4096;

@@ -1,3 +1,7 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/protocol", "crates/storage"]
+
 [package]
 name = "loony-redis"
 version = "0.1.0"
@@ -25,7 +29,8 @@ anyhow = "1"
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
-itoa = "1"
+protocol = { path = "crates/protocol" }
+storage = { path = "crates/storage" }
 
 [dev-dependencies]
 tokio-test = "0.4"

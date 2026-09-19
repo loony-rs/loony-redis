@@ -26,7 +26,7 @@ use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::time::{sleep, Instant};
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{parse_frame, serialize_frame, Frame};
+use protocol::{parse_frame, serialize_frame, Frame};
 
 // ── Constants ──────────────────────────────────────────────────────────────
 

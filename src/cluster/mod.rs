@@ -23,8 +23,8 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-use crate::protocol::{parse_frame, serialize_frame, Frame};
-use crate::storage::{Store, Value};
+use protocol::{parse_frame, serialize_frame, Frame};
+use storage::{Store, Value};
 
 pub const NUM_SLOTS: u16 = 16384;
 

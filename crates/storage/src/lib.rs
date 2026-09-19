@@ -10,7 +10,18 @@ pub use zset::{ScoreBound, ZSet};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Milliseconds since the Unix epoch, used as the store's only notion of
+/// "now". Expiry is always an explicit absolute value carried in a command
+/// (see docs/invariants.md S5) rather than a per-replica-local `Instant`,
+/// which is nondeterministic across replicas and meaningless after restart.
+pub fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_millis() as u64
+}
 
 // ── Value ──────────────────────────────────────────────────────────────────
 
@@ -38,12 +49,15 @@ pub enum SnapshotEntry {
 #[derive(Debug)]
 struct Entry {
     value: Value,
-    expires_at: Option<Instant>,
+    /// Absolute expiry, in milliseconds since the Unix epoch. `None` means
+    /// no expiry. Always an explicit value carried by the command that set
+    /// it, never recomputed independently by each replica.
+    expires_at: Option<u64>,
 }
 
 impl Entry {
     fn is_expired(&self) -> bool {
-        self.expires_at.map(|t| Instant::now() > t).unwrap_or(false)
+        self.expires_at.map(|t| now_ms() > t).unwrap_or(false)
     }
 }
 
@@ -77,9 +91,12 @@ impl Store {
         Some(entry.value.clone())
     }
 
-    pub fn set(&self, key: String, value: Value, ttl: Option<Duration>) {
-        let expires_at = ttl.map(|d| Instant::now() + d);
-        self.data.insert(key, Entry { value, expires_at });
+    /// `expire_at`: absolute expiry in epoch milliseconds, or `None` for no
+    /// expiry. This must be computed once by the caller (the command
+    /// proposer), not derived from `now_ms()` inside the store on each
+    /// replica — see docs/invariants.md S5.
+    pub fn set(&self, key: String, value: Value, expire_at: Option<u64>) {
+        self.data.insert(key, Entry { value, expires_at: expire_at });
     }
 
     pub fn del(&self, keys: &[String]) -> usize {
@@ -90,10 +107,12 @@ impl Store {
         self.data.get(key).map(|e| !e.is_expired()).unwrap_or(false)
     }
 
-    pub fn expire(&self, key: &str, ttl: Duration) -> bool {
+    /// `expire_at`: absolute expiry in epoch milliseconds, computed once by
+    /// the caller (see `set`'s doc comment).
+    pub fn expire(&self, key: &str, expire_at: u64) -> bool {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() { return false; }
-            entry.expires_at = Some(Instant::now() + ttl);
+            entry.expires_at = Some(expire_at);
             true
         } else {
             false
@@ -108,8 +127,8 @@ impl Store {
                 match entry.expires_at {
                     None => -1,
                     Some(t) => {
-                        let now = Instant::now();
-                        if t <= now { -2 } else { (t - now).as_millis() as i64 }
+                        let now = now_ms();
+                        if t <= now { -2 } else { (t - now) as i64 }
                     }
                 }
             }
@@ -180,7 +199,7 @@ impl Store {
         };
 
         let idle = match e.expires_at {
-            Some(t) => t.saturating_duration_since(Instant::now()).as_secs(),
+            Some(t) => t.saturating_sub(now_ms()) / 1000,
             None    => 0,
         };
 
@@ -1004,9 +1023,29 @@ mod tests {
     #[test]
     fn test_ttl_expiry() {
         let s = Store::new();
-        s.set("k".into(), Value::String(Bytes::from("v")), Some(Duration::from_nanos(1)));
-        std::thread::sleep(Duration::from_millis(1));
+        // expire_at is an absolute timestamp already in the past by the
+        // time get() checks it, so this is deterministic given `now_ms()`
+        // read once here -- no reliance on a store-internal clock read at
+        // set-time (there isn't one anymore).
+        s.set("k".into(), Value::String(Bytes::from("v")), Some(now_ms()));
+        std::thread::sleep(std::time::Duration::from_millis(2));
         assert!(s.get("k").is_none());
+    }
+
+    #[test]
+    fn test_expire_at_is_explicit_not_recomputed_per_replica() {
+        // Two independent stores ("replicas") applying the same Set command
+        // with the same absolute expire_at must agree on remaining TTL. The
+        // old Instant-based design would have each replica compute its own
+        // expiry relative to its own clock read at apply-time, which is
+        // exactly the nondeterminism S5 (docs/invariants.md) forbids.
+        let expire_at = now_ms() + 10_000;
+        let a = Store::new();
+        let b = Store::new();
+        a.set("k".into(), Value::String(Bytes::from("v")), Some(expire_at));
+        b.set("k".into(), Value::String(Bytes::from("v")), Some(expire_at));
+        let diff = (a.pttl("k") - b.pttl("k")).abs();
+        assert!(diff < 50, "pttl diverged by {diff}ms between replicas given identical expire_at");
     }
 
     #[test]

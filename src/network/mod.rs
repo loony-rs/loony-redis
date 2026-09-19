@@ -10,9 +10,9 @@ use crate::commands::{execute, CommandContext};
 use crate::consensus::Raft;
 use crate::observability::Metrics;
 use crate::persistence::Aof;
-use crate::protocol::{parse_frame, write_frame_into, Frame};
+use protocol::{parse_frame, write_frame_into, Frame};
 use crate::replication::{snapshot_entry_to_resp, Replication};
-use crate::storage::Store;
+use storage::Store;
 
 pub struct Server {
     store:   Arc<Store>,

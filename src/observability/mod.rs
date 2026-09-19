@@ -8,7 +8,7 @@ use tracing::{error, info};
 
 use crate::cluster::{NodeState, SharedCluster, SharedHealth};
 use crate::replication::Replication;
-use crate::storage::Store;
+use storage::Store;
 
 // ── Per-command counters ───────────────────────────────────────────────────
 

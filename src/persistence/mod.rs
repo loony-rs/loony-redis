@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::protocol::{parse_frame, Frame};
+use protocol::{parse_frame, Frame};
 
 pub struct Aof {
     file: Mutex<tokio::fs::File>,

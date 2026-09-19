@@ -6,9 +6,9 @@ use crate::cluster::{command_slot, node_id_of, CommandSlot, NodeState, SharedClu
 use crate::consensus::Raft;
 use crate::observability::Metrics;
 use crate::persistence::Aof;
-use crate::protocol::{serialize_frame, Frame};
+use protocol::{serialize_frame, Frame};
 use crate::replication::Replication;
-use crate::storage::{ScoreBound, Store, Value};
+use storage::{now_ms, ScoreBound, Store, Value};
 
 pub struct CommandContext {
     pub store:   Arc<Store>,
@@ -349,7 +349,7 @@ fn cmd_expire(args: &[Frame], ctx: &CommandContext) -> Frame {
         Some(n) if n >= 0 => n as u64,
         _ => return Frame::error("ERR invalid expire time"),
     };
-    let set = ctx.store.expire(&key, std::time::Duration::from_secs(secs));
+    let set = ctx.store.expire(&key, now_ms() + secs * 1000);
     Frame::integer(if set { 1 } else { 0 })
 }
 
@@ -362,7 +362,7 @@ fn cmd_pexpire(args: &[Frame], ctx: &CommandContext) -> Frame {
         Some(n) if n >= 0 => n as u64,
         _ => return Frame::error("ERR invalid expire time"),
     };
-    let set = ctx.store.expire(&key, std::time::Duration::from_millis(ms));
+    let set = ctx.store.expire(&key, now_ms() + ms);
     Frame::integer(if set { 1 } else { 0 })
 }
 
@@ -424,8 +424,11 @@ async fn cmd_set(args: &[Frame], ctx: &CommandContext) -> Frame {
     let key = match bulk_as_str(args, 1) { Some(k) => k, None => return wrong_num_args("set") };
     let val = match bulk_bytes(args, 2) { Some(v) => v, None => return wrong_num_args("set") };
 
-    // Parse optional EX / PX options
-    let mut ttl: Option<std::time::Duration> = None;
+    // Parse optional EX / PX options. `expire_at` is computed here, once, as
+    // an absolute epoch-ms timestamp -- see storage::now_ms's doc comment
+    // and docs/invariants.md S5 for why this must not be a relative
+    // Duration re-resolved later or on another replica.
+    let mut expire_at: Option<u64> = None;
     let mut nx = false;
     let mut xx = false;
     let mut i = 3;
@@ -433,15 +436,15 @@ async fn cmd_set(args: &[Frame], ctx: &CommandContext) -> Frame {
         match bulk_as_str(args, i).as_deref() {
             Some("EX") => {
                 i += 1;
-                ttl = bulk_as_i64(args, i)
+                expire_at = bulk_as_i64(args, i)
                     .filter(|&n| n > 0)
-                    .map(|n| std::time::Duration::from_secs(n as u64));
+                    .map(|n| now_ms() + (n as u64) * 1000);
             }
             Some("PX") => {
                 i += 1;
-                ttl = bulk_as_i64(args, i)
+                expire_at = bulk_as_i64(args, i)
                     .filter(|&n| n > 0)
-                    .map(|n| std::time::Duration::from_millis(n as u64));
+                    .map(|n| now_ms() + n as u64);
             }
             Some("NX") => nx = true,
             Some("XX") => xx = true,
@@ -458,7 +461,7 @@ async fn cmd_set(args: &[Frame], ctx: &CommandContext) -> Frame {
         return Frame::null_bulk();
     }
 
-    ctx.store.set(key.clone(), Value::String(val.clone()), ttl);
+    ctx.store.set(key.clone(), Value::String(val.clone()), expire_at);
 
     if let Some(aof) = &ctx.aof {
         let _ = aof.log_set(&key, &val).await;

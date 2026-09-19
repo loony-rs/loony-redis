@@ -403,8 +403,9 @@ dependencies = [
  "clap",
  "criterion",
  "dashmap",
- "itoa",
+ "protocol",
  "rand",
+ "storage",
  "thiserror",
  "tokio",
  "tokio-test",
@@ -547,6 +548,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "protocol"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "itoa",
 ]
 
 [[package]]
@@ -743,6 +752,16 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "dashmap",
+ "rand",
 ]
 
 [[package]]

@@ -1,10 +1,7 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use loony_redis::{
-    protocol::{parse_frame, serialize_frame, write_frame_into, Frame},
-    storage::Store,
-};
-use bytes::BytesMut;
+use protocol::{parse_frame, serialize_frame, write_frame_into, Frame};
+use storage::Store;
 
 // ── Protocol parsing ───────────────────────────────────────────────────────
 
@@ -91,7 +88,7 @@ fn bench_store(c: &mut Criterion) {
     let val   = Bytes::from_static(b"bench_value");
 
     // Seed one key for GET benchmarks.
-    store.set(key.clone(), loony_redis::storage::Value::String(val.clone()), None);
+    store.set(key.clone(), storage::Value::String(val.clone()), None);
 
     g.throughput(Throughput::Elements(1));
 
@@ -99,7 +96,7 @@ fn bench_store(c: &mut Criterion) {
         b.iter(|| {
             store.set(
                 std::hint::black_box(key.clone()),
-                loony_redis::storage::Value::String(std::hint::black_box(val.clone())),
+                storage::Value::String(std::hint::black_box(val.clone())),
                 None,
             )
         })
@@ -135,7 +132,7 @@ fn bench_roundtrip_set(c: &mut Criterion) {
                 {
                     store.set(
                         String::from_utf8_lossy(k).into_owned(),
-                        loony_redis::storage::Value::String(v.clone()),
+                        storage::Value::String(v.clone()),
                         None,
                     );
                 }
