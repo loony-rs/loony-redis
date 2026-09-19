@@ -247,23 +247,41 @@ stable across 5 repeated runs (no flakiness observed).
 **Acceptance:** met for a single shard. `cargo build/test --workspace`
 clean (67 tests total), zero clippy warnings on the new crate.
 
-## Phase 5 — Sharding
+## Phase 5 — Sharding (done)
 
 **Goal:** slot table, CRC16/hash-tag routing (ported, already correct),
 slot -> shard mapping, MOVED replies (decision 0003 — no proxying).
 
-**Work:** per `docs/sharding.md`. At this point there's still one shard
-(so "routing" mostly means "confirm every key maps to slot -> that one
-shard" and MOVED never actually fires yet) — this phase validates the
-slot math and the MOVED code path exists and is wired, ahead of Phase 6
-making it actually necessary.
+**Work done:**
+- New `crates/cluster`: `slots.rs` ports the prototype's CRC16-CCITT +
+  hash-tag extraction unchanged (it was already correct); `routing.rs`
+  ports `CommandSlot`/`command_slot` (per-command key extraction) from
+  the prototype too, but replaces the prototype's address-based
+  `ClusterConfig` and its transparent `proxy_to` with a plain
+  `SlotTable` (`slot -> (ShardId, leader_addr)`) and a `route()` decision
+  function returning `Local`/`Moved{slot, leader_addr}`/`CrossSlot` —
+  no server-side proxying (decision 0003).
+- `SlotTable` is deliberately not yet the consensus-backed `ClusterState`
+  from docs/membership.md (that's Phase 7): it's a directly-constructed
+  map, and an **unset** slot defaults to `Local` rather than an error,
+  since there's no other authoritative source yet. Only an explicit
+  entry pointing at a different shard produces a `MOVED`.
+- Wired into `crates/server`: `Server::with_cluster_routing(my_shard,
+  slot_table)` is a builder method (routing is a no-op by default via
+  plain `Server::new`, unaffected). `dispatch` checks routing before
+  executing and returns `-MOVED`/`-CROSSSLOT` directly, never proxies.
 
-**Tests:** slot/hash-tag unit and property tests (ported + extended),
-routing-decision unit tests against a synthetic multi-shard slot table
-even though only one real shard exists yet.
+**Tests:** 17 in `crates/cluster` — the ported CRC16 test vectors and
+hash-tag cases, 3 proptest properties (slot hashing is deterministic,
+always in range, matching hash tags colocate), and unit tests for
+`command_slot`/`route` against a synthetic multi-shard `SlotTable`. Plus
+3 new end-to-end tests in `crates/server` using a real TCP client against
+a routed server: `-MOVED` for a slot a fake second shard owns, local
+handling for a slot with no recorded owner, and `-CROSSSLOT` for a
+multi-key command spanning slots.
 
-**Acceptance:** slot math matches Redis test vectors; MOVED reply path is
-exercised by a test that fakes a second shard's ownership entry.
+**Acceptance:** met. `cargo build/test --workspace` clean (84 tests
+total), no new clippy warnings.
 
 ## Phase 6 — Multi-shard replication
 

@@ -1,0 +1,11 @@
+[package]
+name = "cluster"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+protocol = { path = "../protocol" }
+bytes = "1"
+
+[dev-dependencies]
+proptest = "1"

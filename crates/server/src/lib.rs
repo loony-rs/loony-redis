@@ -57,6 +57,20 @@ pub struct Server {
     store: Arc<Store>,
     limits: Arc<Limits>,
     conn_count: Arc<AtomicUsize>,
+    cluster: Arc<ClusterRouting>,
+}
+
+/// This shard's routing identity. `slot_table` is `None` by default,
+/// meaning routing is a no-op and every command is handled locally --
+/// the correct behavior for Phase 5/6 (a single real shard) and for any
+/// deployment that hasn't been given a routing table at all. Wrapped in
+/// `Arc` rather than `Arc<RwLock<_>>` for now: nothing in this phase
+/// mutates it after `Server::new`. Phase 7's consensus-backed
+/// `ClusterState` will need it to change at runtime, at which point this
+/// becomes a shared, updatable handle instead of a fixed snapshot.
+struct ClusterRouting {
+    my_shard: cluster::ShardId,
+    slot_table: Option<cluster::SlotTable>,
 }
 
 impl Server {
@@ -65,7 +79,27 @@ impl Server {
             store,
             limits: Arc::new(limits),
             conn_count: Arc::new(AtomicUsize::new(0)),
+            cluster: Arc::new(ClusterRouting {
+                my_shard: 0,
+                slot_table: None,
+            }),
         }
+    }
+
+    /// Enable slot-based routing: commands whose keys map to a slot this
+    /// shard doesn't own get `-MOVED` (or `-CROSSSLOT` if a multi-key
+    /// command's keys don't all map to the same slot) instead of being
+    /// executed locally. See docs/sharding.md.
+    pub fn with_cluster_routing(
+        mut self,
+        my_shard: cluster::ShardId,
+        slot_table: cluster::SlotTable,
+    ) -> Self {
+        self.cluster = Arc::new(ClusterRouting {
+            my_shard,
+            slot_table: Some(slot_table),
+        });
+        self
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -91,11 +125,12 @@ impl Server {
             let _ = socket.set_nodelay(true);
             let store = self.store.clone();
             let limits = self.limits.clone();
+            let cluster = self.cluster.clone();
             let guard = ConnGuard::new(self.conn_count.clone());
 
             tokio::spawn(async move {
                 let _guard = guard;
-                if let Err(e) = handle_connection(socket, store, limits).await {
+                if let Err(e) = handle_connection(socket, store, limits, cluster).await {
                     if !is_conn_reset(&e) {
                         error!("connection {peer} error: {e}");
                     }
@@ -138,6 +173,7 @@ async fn handle_connection(
     mut socket: TcpStream,
     store: Arc<Store>,
     limits: Arc<Limits>,
+    cluster: Arc<ClusterRouting>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(16 * 1024);
     let mut out = BytesMut::with_capacity(16 * 1024);
@@ -198,7 +234,7 @@ async fn handle_connection(
                         return Ok(());
                     }
 
-                    let response = dispatch(frame, &store, &limits);
+                    let response = dispatch(frame, &store, &limits, &cluster);
                     write_frame_into(&mut out, &response);
                 }
                 Ok(None) => break,
@@ -270,7 +306,7 @@ fn read_len_line(buf: &[u8], start: usize) -> Option<(i64, usize)> {
 
 // ── Command dispatch ─────────────────────────────────────────────────────
 
-fn dispatch(frame: Frame, store: &Store, limits: &Limits) -> Frame {
+fn dispatch(frame: Frame, store: &Store, limits: &Limits, cluster: &ClusterRouting) -> Frame {
     let args = match frame {
         Frame::Array(Some(a)) if !a.is_empty() => a,
         Frame::Array(Some(_)) => return Frame::error("ERR empty command"),
@@ -281,6 +317,17 @@ fn dispatch(frame: Frame, store: &Store, limits: &Limits) -> Frame {
         Some(b) => b.to_ascii_uppercase(),
         None => return Frame::error("ERR invalid command name"),
     };
+
+    if let Some(table) = &cluster.slot_table {
+        let cmd_str = std::str::from_utf8(&cmd).unwrap_or("");
+        match cluster::route(table, cluster.my_shard, cmd_str, &args) {
+            cluster::RoutingDecision::Local => {}
+            cluster::RoutingDecision::CrossSlot => return cluster::crossslot_error(),
+            cluster::RoutingDecision::Moved { slot, leader_addr } => {
+                return cluster::moved_error(slot, &leader_addr);
+            }
+        }
+    }
 
     match cmd.as_slice() {
         b"PING" => cmd_ping(&args),
@@ -641,6 +688,19 @@ mod tests {
         (addr, store)
     }
 
+    async fn start_routed_test_server(
+        my_shard: cluster::ShardId,
+        slot_table: cluster::SlotTable,
+    ) -> std::net::SocketAddr {
+        let store = Arc::new(Store::new());
+        let server =
+            Server::new(store, Limits::default()).with_cluster_routing(my_shard, slot_table);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener));
+        addr
+    }
+
     async fn read_response(socket: &mut TcpStream) -> Vec<u8> {
         let mut buf = vec![0u8; 4096];
         let n = socket.read(&mut buf).await.unwrap();
@@ -841,6 +901,55 @@ mod tests {
         }
         let s = String::from_utf8_lossy(&got);
         assert!(s.contains("max pipeline depth"), "unexpected: {s}");
+    }
+
+    #[tokio::test]
+    async fn test_moved_reply_when_another_shard_owns_the_slot() {
+        let key = b"routed-key";
+        let slot = cluster::slot_for_key(key);
+        let mut table = cluster::SlotTable::new();
+        table.set_owner(slot..=slot, 2, "127.0.0.1:9999");
+
+        let addr = start_routed_test_server(1, table).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+
+        sock.write_all(b"*2\r\n$3\r\nGET\r\n$10\r\nrouted-key\r\n")
+            .await
+            .unwrap();
+        let resp = read_response(&mut sock).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert_eq!(s, format!("-MOVED {slot} 127.0.0.1:9999\r\n"));
+    }
+
+    #[tokio::test]
+    async fn test_unowned_slot_defaults_to_local() {
+        // No entry recorded for this key's slot at all -- Phase 5 has no
+        // consensus-backed ClusterState yet (that's Phase 7), so an unset
+        // slot must default to local rather than erroring.
+        let table = cluster::SlotTable::new();
+        let addr = start_routed_test_server(1, table).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+
+        sock.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_response(&mut sock).await, b"+OK\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_crossslot_rejected_when_keys_span_slots() {
+        let table = cluster::SlotTable::new();
+        let addr = start_routed_test_server(1, table).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+
+        // "foo" and "bar" are known (from the CRC16 test vectors) to hash
+        // to different slots.
+        sock.write_all(b"*3\r\n$3\r\nDEL\r\n$3\r\nfoo\r\n$3\r\nbar\r\n")
+            .await
+            .unwrap();
+        let resp = read_response(&mut sock).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("-CROSSSLOT"), "unexpected: {s}");
     }
 
     #[test]
