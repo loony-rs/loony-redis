@@ -4,16 +4,24 @@
 //! length prefix followed by a bincode-encoded [`RpcRequest`]/
 //! [`RpcResponse`].
 //!
+//! Generic over any `RaftTypeConfig` fixing `NodeId`/`Node` to this
+//! crate's aliases -- every group in this project (a shard's data group
+//! or the metadata group, Phase 7) uses the same transport, differing
+//! only in what command type (`D`) travels inside `AppendEntriesRequest`.
+//!
 //! Also provides [`PartitionControl`], a shared, explicitly-gated table
 //! of blocked (from, to) links. It's the mechanism the Phase 4 partition
 //! tests use to simulate a network partition without a real proxy layer
 //! (that's Phase 8's fault-injection harness); a connection attempt whose
 //! (from, to) pair is blocked fails immediately as `Unreachable`, exactly
 //! as if the peer really were unreachable. Production use simply never
-//! blocks anything.
+//! blocks anything. Not generic itself -- every group's `NodeId` is this
+//! crate's plain `u64` alias, so one table's (from, to) pairs are
+//! meaningful regardless of which group's `Network` consults it.
 
 use std::collections::HashSet;
 use std::io;
+use std::marker::PhantomData;
 use std::sync::Arc;
 
 use openraft::error::{InstallSnapshotError, NetworkError, RemoteError, Unreachable};
@@ -22,19 +30,28 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
+use openraft::RaftTypeConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
-use crate::{Node, NodeId, Raft, RaftError, TypeConfig};
+use crate::{Node, NodeId, RaftError};
 
+// `serde(bound = "")` disables serde-derive's default (and here overly
+// strict) auto-generated `where C: Serialize` bound -- `C` itself is
+// never serialized, only `AppendEntriesRequest<C>`/`InstallSnapshotRequest<C>`,
+// whose own impls carry whatever bounds they actually need.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-enum RpcRequest {
-    AppendEntries(AppendEntriesRequest<TypeConfig>),
+#[serde(bound = "")]
+enum RpcRequest<C: RaftTypeConfig> {
+    AppendEntries(AppendEntriesRequest<C>),
     Vote(VoteRequest<NodeId>),
-    InstallSnapshot(InstallSnapshotRequest<TypeConfig>),
+    InstallSnapshot(InstallSnapshotRequest<C>),
 }
 
+// Note: unlike `RpcRequest`, this doesn't need to be generic over `C` --
+// `AppendEntriesResponse`/`VoteResponse`/`InstallSnapshotResponse` are all
+// typed by `NodeId` alone, independent of the group's command type.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 enum RpcResponse {
     AppendEntries(Result<AppendEntriesResponse<NodeId>, RaftError>),
@@ -73,20 +90,37 @@ impl PartitionControl {
     }
 }
 
-#[derive(Clone)]
-pub struct Network {
+pub struct Network<C> {
     my_id: NodeId,
     links: Arc<PartitionControl>,
+    _config: PhantomData<C>,
 }
 
-impl Network {
-    pub fn new(my_id: NodeId, links: Arc<PartitionControl>) -> Self {
-        Network { my_id, links }
+impl<C> Clone for Network<C> {
+    fn clone(&self) -> Self {
+        Network {
+            my_id: self.my_id,
+            links: self.links.clone(),
+            _config: PhantomData,
+        }
     }
 }
 
-impl RaftNetworkFactory<TypeConfig> for Network {
-    type Network = Connection;
+impl<C> Network<C> {
+    pub fn new(my_id: NodeId, links: Arc<PartitionControl>) -> Self {
+        Network {
+            my_id,
+            links,
+            _config: PhantomData,
+        }
+    }
+}
+
+impl<C> RaftNetworkFactory<C> for Network<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
+    type Network = Connection<C>;
 
     async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
         Connection {
@@ -94,19 +128,24 @@ impl RaftNetworkFactory<TypeConfig> for Network {
             target,
             addr: node.addr.clone(),
             links: self.links.clone(),
+            _config: PhantomData,
         }
     }
 }
 
-pub struct Connection {
+pub struct Connection<C> {
     from: NodeId,
     target: NodeId,
     addr: String,
     links: Arc<PartitionControl>,
+    _config: PhantomData<C>,
 }
 
-impl Connection {
-    async fn call(&self, req: &RpcRequest) -> io::Result<RpcResponse> {
+impl<C> Connection<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
+    async fn call(&self, req: &RpcRequest<C>) -> io::Result<RpcResponse> {
         if self.links.is_blocked(self.from, self.target).await {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -159,10 +198,13 @@ impl Connection {
     }
 }
 
-impl RaftNetwork<TypeConfig> for Connection {
+impl<C> RaftNetwork<C> for Connection<C>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
     async fn append_entries(
         &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
+        rpc: AppendEntriesRequest<C>,
         _option: RPCOption,
     ) -> Result<AppendEntriesResponse<NodeId>, openraft::error::RPCError<NodeId, Node, RaftError>>
     {
@@ -180,7 +222,7 @@ impl RaftNetwork<TypeConfig> for Connection {
 
     async fn install_snapshot(
         &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
+        rpc: InstallSnapshotRequest<C>,
         _option: RPCOption,
     ) -> Result<
         InstallSnapshotResponse<NodeId>,
@@ -222,7 +264,10 @@ fn to_io_err(e: impl std::fmt::Display) -> io::Error {
 
 /// Bind `addr` and serve (see [`serve`]). Split out so callers that don't
 /// need to know the bound port up front can do it in one call.
-pub async fn serve_addr(addr: &str, raft: Raft) -> anyhow::Result<()> {
+pub async fn serve_addr<C>(addr: &str, raft: openraft::Raft<C>) -> anyhow::Result<()>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
     let listener = TcpListener::bind(addr).await?;
     serve(listener, raft).await
 }
@@ -235,7 +280,10 @@ pub async fn serve_addr(addr: &str, raft: Raft) -> anyhow::Result<()> {
 /// `listener.local_addr()`, and only then start serving -- no bind/rebind
 /// race, which matters for tests that spin up many nodes on ephemeral
 /// ports.
-pub async fn serve(listener: TcpListener, raft: Raft) -> anyhow::Result<()> {
+pub async fn serve<C>(listener: TcpListener, raft: openraft::Raft<C>) -> anyhow::Result<()>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
     loop {
         let (socket, _peer) = listener.accept().await?;
         let raft = raft.clone();
@@ -245,13 +293,16 @@ pub async fn serve(listener: TcpListener, raft: Raft) -> anyhow::Result<()> {
     }
 }
 
-async fn handle_conn(mut socket: TcpStream, raft: Raft) -> io::Result<()> {
+async fn handle_conn<C>(mut socket: TcpStream, raft: openraft::Raft<C>) -> io::Result<()>
+where
+    C: RaftTypeConfig<NodeId = NodeId, Node = Node, Entry = openraft::Entry<C>>,
+{
     let mut len_buf = [0u8; 4];
     socket.read_exact(&mut len_buf).await?;
     let len = u32::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; len];
     socket.read_exact(&mut buf).await?;
-    let req: RpcRequest = bincode::deserialize(&buf).map_err(to_io_err)?;
+    let req: RpcRequest<C> = bincode::deserialize(&buf).map_err(to_io_err)?;
 
     let resp = match req {
         RpcRequest::AppendEntries(r) => RpcResponse::AppendEntries(raft.append_entries(r).await),

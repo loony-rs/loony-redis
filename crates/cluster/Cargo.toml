@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 protocol = { path = "../protocol" }
 bytes = "1"
+serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 proptest = "1"

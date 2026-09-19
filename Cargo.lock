@@ -299,6 +299,7 @@ dependencies = [
  "bytes",
  "proptest",
  "protocol",
+ "serde",
 ]
 
 [[package]]
@@ -768,6 +769,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
+]
+
+[[package]]
+name = "membership"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "cluster",
+ "crc32c",
+ "openraft",
+ "persistence",
+ "raft",
+ "rand 0.8.6",
+ "serde",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

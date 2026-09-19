@@ -1,0 +1,20 @@
+[package]
+name = "membership"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+raft = { path = "../raft" }
+cluster = { path = "../cluster" }
+persistence = { path = "../persistence" }
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32c = "0.6"
+rand = "0.8"
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

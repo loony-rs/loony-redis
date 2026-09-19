@@ -319,22 +319,58 @@ across 4 repeated runs.
 **Acceptance:** met. `cargo build/test --workspace` clean (89 tests
 total), no new clippy warnings.
 
-## Phase 7 — Cluster membership
+## Phase 7 — Cluster membership (done)
 
 **Goal:** the metadata Raft group (decision 0002): node identity, JOIN/
 LEAVE/REJOIN, consensus-backed `ClusterState`.
 
-**Work:** per `docs/membership.md`. Replaces the prototype's
-`address-derived node_id` and gossip-only `ClusterConfig`/`auto_heal`.
+**Work done:**
+- Genericized `crates/raft`'s `LogStore`/`Network` (now `LogStore<C>`/
+  `Network<C>`, bounded on `C: RaftTypeConfig<NodeId = NodeId, Node =
+  Node, Entry = openraft::Entry<C>>`) so the metadata group could reuse
+  the exact same WAL-backed log storage and TCP transport instead of
+  duplicating either — the only thing that actually varies between a
+  shard's data group and the metadata group is the command type (`D`),
+  and neither `LogStore` nor `Network` ever inspected that. Verified
+  zero behavioral change: all pre-existing Phase 4/6 tests pass unchanged
+  against the now-generic code. `raft::blob` (checksummed small-value
+  persistence) was also made `pub` for reuse rather than duplicated.
+- New `crates/membership`:
+  - `identity.rs`: `NodeIdentity`, a 128-bit random value generated once
+    and persisted at `<dir>/identity`, independent of network address
+    (docs/membership.md). `raft_id()` deterministically derives an
+    `openraft` `u64` `NodeId` from it (FNV-1a hash) for use as this
+    node's Raft-level id in any group — the stable identity, not the
+    address, is what's durable. A corrupt identity file is a hard error,
+    never silently replaced with a fresh identity.
+  - `command.rs`: `MetaCommand` (`AddNode`/`RemoveNode`/
+    `UpdateNodeAddress`/`SetSlotOwner`) plus a deterministic `apply`.
+  - `state_machine.rs`: `ClusterState` (node addresses + `cluster::SlotTable`,
+    which gained `Serialize`/`Deserialize` for this) and
+    `MetaStateMachineStore`, mirroring `raft::StateMachineStore`'s
+    pattern but much simpler (no WAL-scale data, whole-state snapshots).
+  - `lib.rs`: `MetaTypeConfig` (`D = MetaCommand`) and `start_meta_node`,
+    built entirely from `crates/raft`'s now-generic pieces.
+  - Membership changes (JOIN/LEAVE/REJOIN) are `MetaCommand`s proposed
+    to the metadata group; deliberately *not* tied to the metadata
+    group's own Raft voter set, which stays a fixed, manually-configured
+    membership for now (dynamic voter changes are Phase 8/9-adjacent
+    capacity concerns, not needed for Phase 7's scope).
 
-**Tests:** join a new node, verify it's visible cluster-wide via the
-metadata group's committed state (not just locally); leave/rejoin;
-verify no unilateral `auto_heal`-style membership change without a
-committed metadata-group entry.
+**Tests:** 9 unit tests in `crates/membership` (identity persistence and
+corruption handling, `MetaCommand::apply` determinism, state-machine
+apply/snapshot round-trips) plus 5 integration tests
+(`crates/membership/tests/cluster.rs`) against a real 3-node metadata
+Raft group over TCP: JOIN visible on every node via committed state (not
+just the proposer), LEAVE removes a node cluster-wide, REJOIN updates an
+existing record's address rather than duplicating it, a leader failure
+provably does *not* mutate `ClusterState` by itself (the property that
+distinguishes this from the prototype's `auto_heal`), and an isolated
+minority leader cannot commit a membership change while the healthy
+majority still can. Stable across 3 repeated runs.
 
-**Acceptance:** membership changes are observably consensus-backed (a
-test that partitions the metadata group's minority side and confirms it
-cannot commit a membership change).
+**Acceptance:** met. `cargo build/test --workspace` clean (103 tests
+total), no new clippy warnings.
 
 ## Phase 8 — Failover
 

@@ -7,13 +7,12 @@
 //! with a 3-node cluster including leader crash and network partition.
 //! Per-shard multi-group composition is Phase 6.
 
-mod blob;
-mod log_store;
+pub mod blob;
+pub mod log_store;
 pub mod network;
 mod state_machine;
 
-pub use log_store::LogStore;
-pub use network::{Network, PartitionControl};
+pub use network::PartitionControl;
 pub use state_machine::StateMachineStore;
 
 use std::io::Cursor;
@@ -21,6 +20,17 @@ use std::sync::Arc;
 
 pub type NodeId = u64;
 pub type Node = openraft::BasicNode;
+
+/// `LogStore`/`Network` are generic over any `RaftTypeConfig` fixing
+/// `NodeId`/`Node` to the aliases above (see `log_store.rs`/`network.rs`)
+/// -- both a shard's data group and the metadata group (Phase 7) use the
+/// same WAL-backed log storage and the same TCP transport, differing only
+/// in their command type. These aliases are the shard-data
+/// instantiation; `membership`'s metadata group uses
+/// `raft::log_store::LogStore<MetaTypeConfig>` /
+/// `raft::network::Network<MetaTypeConfig>` directly.
+pub type LogStore = log_store::LogStore<TypeConfig>;
+pub type Network = network::Network<TypeConfig>;
 
 openraft::declare_raft_types!(
     /// Type configuration for loony-redis's per-shard Raft groups.

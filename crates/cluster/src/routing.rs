@@ -86,7 +86,10 @@ fn all_same_slot(args: &[Frame], start: usize, stride: usize) -> CommandSlot {
 
 /// Slot ownership table: `slot -> (owning shard, that shard's leader
 /// address)`. An unset slot has no explicit owner recorded.
-#[derive(Debug, Clone)]
+///
+/// `Serialize`/`Deserialize` so `membership`'s metadata group (Phase 7)
+/// can include it wholesale in a `ClusterState` snapshot.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SlotTable {
     owners: Vec<Option<(ShardId, String)>>,
 }
