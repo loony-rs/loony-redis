@@ -7,7 +7,7 @@ const MAX_ELEMENT_BYTES: usize = 64;
 
 /// Dual-encoding list: compact `Vec` for small lists, `VecDeque` once either
 /// threshold is exceeded.  All public methods keep the invariant automatically.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum List {
     Small(Vec<Bytes>),
     Large(VecDeque<Bytes>),

@@ -25,7 +25,7 @@ pub fn now_ms() -> u64 {
 
 // ── Value ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     String(Bytes),
     List(List),
@@ -42,6 +42,19 @@ pub enum SnapshotEntry {
     Hash   { key: String, fields: Vec<(Bytes, Bytes)> },
     Set    { key: String, members: Vec<Bytes> },
     ZSet   { key: String, members: Vec<(Bytes, f64)> },
+}
+
+/// A full-fidelity snapshot of one key, including its expiry. Unlike
+/// `SnapshotEntry` (which flattens container types for the legacy
+/// RESP-replay full-sync path and carries no TTL), this is what
+/// `crates/persistence`'s WAL/snapshot format actually persists -- see
+/// docs/persistence.md's requirement that a snapshot capture "every key's
+/// value and its expire_at".
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KeyEntry {
+    pub key: String,
+    pub value: Value,
+    pub expires_at: Option<u64>,
 }
 
 // ── Store internals ────────────────────────────────────────────────────────
@@ -217,6 +230,30 @@ impl Store {
     }
 
     pub fn flush(&self) { self.data.clear(); }
+
+    /// A full-fidelity, TTL-preserving snapshot of every live key. Used by
+    /// `crates/persistence` to build a durable snapshot -- see `KeyEntry`.
+    pub fn snapshot_entries(&self) -> Vec<KeyEntry> {
+        self.data.iter()
+            .filter(|e| !e.value().is_expired())
+            .map(|e| KeyEntry {
+                key: e.key().clone(),
+                value: e.value().value.clone(),
+                expires_at: e.value().expires_at,
+            })
+            .collect()
+    }
+
+    /// Replace the store's entire contents with `entries`. Used to restore
+    /// a snapshot taken via `snapshot_entries` -- callers that need to
+    /// then replay WAL entries on top must do so afterward, in commit
+    /// order (see docs/recovery.md).
+    pub fn restore_entries(&self, entries: Vec<KeyEntry>) {
+        self.flush();
+        for e in entries {
+            self.data.insert(e.key, Entry { value: e.value, expires_at: e.expires_at });
+        }
+    }
 
     pub fn snapshot(&self) -> Vec<SnapshotEntry> {
         self.data.iter()

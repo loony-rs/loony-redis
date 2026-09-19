@@ -28,7 +28,7 @@ fn decode_score(encoded: u64) -> f64 {
 }
 
 /// BTreeMap key: (encoded_score, member).  Enables O(log n) rank and range queries.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 struct ScoreKey {
     encoded: u64,
     member: Bytes,
@@ -95,7 +95,7 @@ impl ScoreBound {
 /// Sorted set with dual-index:
 ///   `scores`   – O(1) member → score lookup
 ///   `by_score` – ordered BTree for rank/range queries, key = (encoded_score, member)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ZSet {
     scores: HashMap<Bytes, f64>,
     by_score: BTreeMap<ScoreKey, ()>,

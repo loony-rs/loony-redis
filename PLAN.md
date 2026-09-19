@@ -134,22 +134,58 @@ EXPIRE/TTL, INFO), all correct. `cargo build --workspace` and
 `cargo test --workspace` clean; `cargo clippy -p server --all-targets` has
 zero warnings.
 
-## Phase 3 — Single-node persistence
+## Phase 3 — Single-node persistence (done)
 
 **Goal:** replace the AOF with the real WAL described in
 `docs/persistence.md`, without Raft yet (a WAL for a single-node "group of
 one" is a useful, independently testable stepping stone toward Phase 4).
 
-**Work:** WAL append/read/checksum/truncation, configurable fsync policy,
-snapshot create/restore, crash recovery sequence from `docs/recovery.md`
-(minus the Raft-rejoin parts, which don't exist yet).
+**Work done:**
+- New `crates/persistence`, with three internal modules:
+  - `wal.rs`: `Wal`/`WalRecord`/`SyncPolicy`. Record format is
+    `magic|version|term|index|payload_len|payload|crc32c` exactly as
+    specified in `docs/persistence.md`. `Wal::open` scans the file on
+    disk (not a streaming reader -- simplicity over efficiency for now,
+    revisit in Phase 11 if profiling says so), stops at the first
+    incomplete-or-checksum-failing record, and truncates the file to end
+    exactly at the last good record before returning. `append` honors
+    `SyncPolicy::{Always, Periodic, Never}`. `compact_before` rewrites the
+    file via temp-file-then-rename for log compaction after a snapshot.
+  - `snapshot.rs`: `Snapshot`/`SnapshotMetadata`, saved/loaded via
+    temp-file-then-rename plus a whole-payload crc32c checksum.
+    `load_latest_snapshot` actually implements the next-older fallback
+    docs/recovery.md requires on corruption, not just a comment about it.
+  - `command.rs`: the `Command` enum from `Prompt.md` section 10
+    (Set/Delete/Expire/ListPushLeft/ListPushRight/ListPopLeft/HashSet/
+    SetAdd) plus a deterministic, panic-free `apply(store, cmd)`.
+- `lib.rs` ties these into `recover` (snapshot load + WAL replay, the
+  docs/recovery.md startup sequence minus the Raft-specific steps),
+  `propose` (append + apply, the pre-Raft "quorum of one" write path), and
+  `snapshot_and_compact`.
+- Extended `storage::Store` with `KeyEntry`/`snapshot_entries`/
+  `restore_entries` so snapshots carry each key's `expire_at` -- the
+  legacy `SnapshotEntry` (still used by the old async-replication
+  full-sync path) doesn't carry TTL at all, and fixing that gap directly
+  in this phase's new snapshot format (rather than leaving it) was
+  required by docs/persistence.md's explicit "snapshot must capture...
+  TTL information". `storage::Value` and its component types
+  (List/Hash/Set/ZSet) gained `serde` derives to make this possible.
 
-**Tests:** the required `write -> crash -> restart -> recover -> verify`
-sequence, plus the corrupt-tail-truncation test, plus the
-snapshot-then-WAL-tail-replay test (R3 in `docs/invariants.md`).
+**Tests:** 15 tests in `crates/persistence`, including the required
+`write -> snapshot -> crash -> restart -> recover -> verify` sequence,
+corrupt-tail truncation (both a torn/incomplete record and a checksum
+mismatch on an otherwise-complete record), WAL compaction correctness,
+snapshot corruption fallback to the next-older snapshot, and an explicit
+R3 test (snapshot partway through a command sequence + WAL replay
+produces the same state as continuous application with no snapshot at
+all). Plus 2 tests on `Command::apply`'s determinism (including the
+WRONGTYPE-is-deterministic-not-a-panic case).
 
-**Acceptance:** all of `docs/recovery.md`'s test matrix passes for a
-single-node deployment.
+**Acceptance:** met for the single-node scope this phase covers (the
+Raft-driven parts of `docs/recovery.md`'s test matrix -- leader vs.
+follower crash specifically -- wait for Phase 4, since there's no leader/
+follower distinction without Raft yet). `cargo build/test --workspace`
+clean (55 tests total), zero clippy warnings introduced by this phase.
 
 ## Phase 4 — Raft (single shard)
 

@@ -7,7 +7,7 @@ const MAX_ELEMENT_BYTES: usize = 64;
 
 /// Dual-encoding set: compact `Vec` for small sets, `HashSet` once thresholds
 /// are exceeded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Set {
     Small(Vec<Bytes>),
     Large(HashSet<Bytes>),

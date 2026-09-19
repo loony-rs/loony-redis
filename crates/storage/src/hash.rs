@@ -6,7 +6,7 @@ const MAX_ELEMENT_BYTES: usize = 64;
 
 /// Dual-encoding hash: flat `Vec` of pairs for small hashes (O(n) but
 /// cache-friendly and allocation-cheap), `HashMap` once thresholds are crossed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Hash {
     Small(Vec<(Bytes, Bytes)>),
     Large(HashMap<Bytes, Bytes>),

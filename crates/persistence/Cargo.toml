@@ -1,11 +1,16 @@
 [package]
-name = "storage"
+name = "persistence"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+storage = { path = "../storage" }
 bytes = { version = "1", features = ["serde"] }
-dashmap = "6"
-rand = "0.8"
-anyhow = "1"
 serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32c = "0.6"
+anyhow = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
