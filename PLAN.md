@@ -86,7 +86,7 @@ storage code (`lower` dead code, `manual_retain` in `list::lrem`,
 legacy modules they're in are slated for deletion/rebuild in Phases 2-4,
 not a general cleanup target now.
 
-## Phase 2 — RESP server
+## Phase 2 — RESP server (done)
 
 **Goal:** a standalone TCP server crate (`crates/server`) that speaks RESP
 against the ported storage crate directly (no sharding, no Raft yet —
@@ -94,18 +94,45 @@ this is deliberately the same shape as the old prototype's Phase 1-2, just
 in the new crate layout), so the network/command-dispatch layer is
 validated before consensus is layered underneath it.
 
-**Work:** port `src/network/mod.rs` + relevant parts of `src/commands/mod.rs`
-(GET/SET/DEL/LPUSH/RPUSH/LPOP/HSET/HGET/SADD/SMEMBERS/EXPIRE/TTL/PING/INFO),
-add the configurable limits from `docs/protocol.md` (max_key_size etc.,
-not present in the prototype).
+**Work done:**
+- New `crates/server` crate (lib + `loony-redis-server` bin), depending
+  only on `protocol` and `storage` — no AOF/replication/Raft/cluster
+  coupling. This is a fresh, narrowly-scoped implementation rather than a
+  line-for-line port of `src/network/mod.rs` + `src/commands/mod.rs`:
+  those files mix in AOF/replication/Raft/cluster concerns that belong to
+  later phases, and the required v1 command list here
+  (PING/GET/SET/DEL/LPUSH/RPUSH/LPOP/HSET/HGET/SADD/SMEMBERS/EXPIRE/TTL/
+  INFO) is a small enough surface that reimplementing it cleanly against
+  the new `Store` API (including the Phase 1 `expire_at: Option<u64>`
+  change) was less risky than surgically extracting it from the legacy
+  1989-line dispatcher. The legacy `src/network` + `src/commands` are left
+  untouched and still build/run as the old monolithic binary; they get
+  folded into/retired in favor of this crate once Raft/WAL/sharding give
+  it real parity (Phases 3-9).
+- Implemented the configurable limits from `docs/protocol.md`:
+  `max_key_size`, `max_value_size`, `max_command_size`,
+  `max_request_size`, `max_pipeline_depth`, `max_connections`. Oversized
+  bulk-string lengths are rejected by peeking the RESP header
+  (`max_declared_bulk_len`) before the body is buffered at all, not after
+  — satisfies "no unbounded memory allocation based on client-controlled
+  lengths" for the classic single-huge-value attack; `max_request_size`
+  is the backstop for buffered-but-incomplete frames in general.
+  `max_connections` is enforced at accept-time via an atomic counter with
+  a `Drop`-based guard, so a connection always decrements it on close.
 
-**Tests:** fragmented-packet and pipelining tests (ported), plus new
-limit-enforcement tests (oversized key/value/command rejected before
-allocation).
+**Tests:** 10 tests in `crates/server`: the required command list
+end-to-end, a fragmented-packet test (one command trickled in across many
+1-byte-delayed writes), a pipelining test (three commands in one write,
+batched responses), and five limit-enforcement tests (oversized value
+rejected before the body arrives, oversized key rejected, pipeline-depth
+cap enforced, plus two unit tests directly on the header-peeking scanner).
 
-**Acceptance:** a real client (e.g. `redis-cli` for the overlapping
-command subset) can connect and run the required command list end to end
-against a single node with no replication.
+**Acceptance:** met — verified manually with real `redis-cli` against the
+running `loony-redis-server` binary for the full required command list
+(PING, SET/GET/DEL, LPUSH/RPUSH/LPOP, HSET/HGET, SADD/SMEMBERS,
+EXPIRE/TTL, INFO), all correct. `cargo build --workspace` and
+`cargo test --workspace` clean; `cargo clippy -p server --all-targets` has
+zero warnings.
 
 ## Phase 3 — Single-node persistence
 

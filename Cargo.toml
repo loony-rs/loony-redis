@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = [".", "crates/protocol", "crates/storage"]
+members = [".", "crates/protocol", "crates/storage", "crates/server"]
 
 [package]
 name = "loony-redis"
