@@ -4,174 +4,22 @@
 //! docs/testing.md / PLAN.md Phase 4 acceptance: basic replication,
 //! leader crash + election + continued writes + rejoin-catch-up, and
 //! both partition scenarios from docs/failure-model.md.
+//!
+//! The harness itself (`TestNode`, `spawn_cluster`, ...) lives in
+//! `tests/common/mod.rs`, shared with `multi_shard.rs` (Phase 6).
 
-use bytes::Bytes;
-use openraft::Config;
-use persistence::Command;
-use raft::{Network, Node, NodeId, PartitionControl, Raft, StateMachineStore};
-use std::sync::Arc;
+mod common;
+
+use common::*;
+use raft::{NodeId, PartitionControl};
 use std::time::Duration;
-use tempfile::TempDir;
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn test_config() -> Arc<Config> {
-    Arc::new(
-        Config {
-            heartbeat_interval: 50,
-            election_timeout_min: 200,
-            election_timeout_max: 400,
-            ..Default::default()
-        }
-        .validate()
-        .unwrap(),
-    )
-}
-
-struct TestNode {
-    id: NodeId,
-    addr: String,
-    _dir: TempDir,
-    raft: Raft,
-    sm: Arc<StateMachineStore>,
-    serve_task: JoinHandle<()>,
-}
-
-impl TestNode {
-    async fn spawn(id: NodeId, links: Arc<PartitionControl>) -> TestNode {
-        Self::spawn_at(id, "127.0.0.1:0", None, links).await
-    }
-
-    /// Rejoin using the same on-disk directory and, per docs/membership.md
-    /// (address changes require a propagated update, which doesn't exist
-    /// until Phase 7), the same network address as before.
-    async fn rejoin_at(
-        id: NodeId,
-        addr: &str,
-        dir: TempDir,
-        links: Arc<PartitionControl>,
-    ) -> TestNode {
-        Self::spawn_at(id, addr, Some(dir), links).await
-    }
-
-    async fn spawn_at(
-        id: NodeId,
-        addr: &str,
-        existing_dir: Option<TempDir>,
-        links: Arc<PartitionControl>,
-    ) -> TestNode {
-        let dir = existing_dir.unwrap_or_else(|| tempfile::tempdir().unwrap());
-        let listener = TcpListener::bind(addr).await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-
-        let network = Network::new(id, links);
-        let (raft_handle, _log_store, sm) =
-            raft::start_node(id, dir.path(), test_config(), network)
-                .await
-                .unwrap();
-
-        let serve_raft = raft_handle.clone();
-        let serve_task = tokio::spawn(async move {
-            let _ = raft::network::serve(listener, serve_raft).await;
-        });
-
-        TestNode {
-            id,
-            addr,
-            _dir: dir,
-            raft: raft_handle,
-            sm,
-            serve_task,
-        }
-    }
-
-    /// Simulate a crash: stop accepting RPCs (peers see connection
-    /// refused, matching a dead process) and shut down the local Raft
-    /// core. Takes `&self` (not `self`) so the caller keeps ownership of
-    /// the on-disk directory for a later rejoin.
-    async fn kill(&self) {
-        self.serve_task.abort();
-        let _ = self.raft.shutdown().await;
-    }
-}
-
-async fn spawn_cluster(links: Arc<PartitionControl>) -> Vec<TestNode> {
-    let mut nodes = Vec::new();
-    for id in 1..=3u64 {
-        nodes.push(TestNode::spawn(id, links.clone()).await);
-    }
-
-    let mut members = std::collections::BTreeMap::new();
-    for n in &nodes {
-        members.insert(
-            n.id,
-            Node {
-                addr: n.addr.clone(),
-            },
-        );
-    }
-    nodes[0].raft.initialize(members).await.unwrap();
-    wait_for_leader(&nodes).await;
-    nodes
-}
-
-async fn wait_for_leader(nodes: &[TestNode]) -> NodeId {
-    wait_for_leader_excluding(nodes.iter(), &[]).await
-}
-
-/// Like `wait_for_leader`, but ignores a stale `current_leader` belief
-/// that still names a node in `exclude` -- a follower's metrics don't
-/// clear `current_leader` the instant the old leader dies, only once the
-/// follower itself notices (via a failed heartbeat/election timeout) and
-/// a new leader is actually elected.
-async fn wait_for_leader_excluding<'a>(
-    nodes: impl Iterator<Item = &'a TestNode> + Clone,
-    exclude: &[NodeId],
-) -> NodeId {
-    let deadline = tokio::time::Instant::now() + TEST_TIMEOUT;
-    loop {
-        for n in nodes.clone() {
-            if let Some(leader) = n.raft.metrics().borrow().current_leader {
-                if !exclude.contains(&leader) {
-                    return leader;
-                }
-            }
-        }
-        if tokio::time::Instant::now() > deadline {
-            panic!("no new leader elected within {TEST_TIMEOUT:?} (excluding {exclude:?})");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
-fn leader_node(nodes: &[TestNode], leader_id: NodeId) -> &TestNode {
-    nodes
-        .iter()
-        .find(|n| n.id == leader_id)
-        .expect("leader id must be one of the cluster's nodes")
-}
-
-fn set_cmd(key: &str, value: &str) -> Command {
-    Command::Set {
-        key: key.into(),
-        value: Bytes::from(value.to_string()),
-        expire_at: None,
-    }
-}
-
-fn get_string(sm: &StateMachineStore, key: &str) -> Option<String> {
-    match sm.store.get(key) {
-        Some(storage::Value::String(b)) => Some(String::from_utf8_lossy(&b).into_owned()),
-        _ => None,
-    }
-}
+const SHARD: [NodeId; 3] = [1, 2, 3];
 
 #[tokio::test]
 async fn test_three_node_replication() {
     let links = PartitionControl::new();
-    let nodes = spawn_cluster(links).await;
+    let nodes = spawn_cluster(&SHARD, links).await;
 
     let leader_id = wait_for_leader(&nodes).await;
     let leader = leader_node(&nodes, leader_id);
@@ -196,7 +44,7 @@ async fn test_three_node_replication() {
 #[tokio::test]
 async fn test_leader_crash_election_continues_and_rejoin_catches_up() {
     let links = PartitionControl::new();
-    let mut nodes = spawn_cluster(links.clone()).await;
+    let mut nodes = spawn_cluster(&SHARD, links.clone()).await;
 
     let old_leader_id = wait_for_leader(&nodes).await;
     let idx1 = leader_node(&nodes, old_leader_id)
@@ -273,7 +121,7 @@ async fn test_leader_crash_election_continues_and_rejoin_catches_up() {
 #[tokio::test]
 async fn test_minority_partition_isolated_leader_cannot_commit() {
     let links = PartitionControl::new();
-    let nodes = spawn_cluster(links.clone()).await;
+    let nodes = spawn_cluster(&SHARD, links.clone()).await;
 
     let leader_id = wait_for_leader(&nodes).await;
     let others: Vec<NodeId> = nodes
@@ -344,7 +192,7 @@ async fn test_minority_partition_isolated_leader_cannot_commit() {
 #[tokio::test]
 async fn test_majority_partition_continues_without_isolated_follower() {
     let links = PartitionControl::new();
-    let nodes = spawn_cluster(links.clone()).await;
+    let nodes = spawn_cluster(&SHARD, links.clone()).await;
 
     let leader_id = wait_for_leader(&nodes).await;
     let followers: Vec<NodeId> = nodes

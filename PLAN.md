@@ -283,20 +283,41 @@ multi-key command spanning slots.
 **Acceptance:** met. `cargo build/test --workspace` clean (84 tests
 total), no new clippy warnings.
 
-## Phase 6 — Multi-shard replication
+## Phase 6 — Multi-shard replication (done)
 
 **Goal:** multiple concurrent shard Raft groups in one process/cluster,
 each independently leading and committing.
 
-**Work:** generalize Phase 4's single-group wiring to N groups
-(`docs/raft.md`'s "one Raft group per shard" section becomes real here).
+**Work done:** the production code in `crates/raft` needed no changes for
+this: every `start_node`/`Network`/`LogStore`/`StateMachineStore` call was
+already fully self-contained (its own directory, its own listener
+address, its own `Raft` handle), so running N shards in one process was
+already mechanically possible — nothing in Phase 4's design assumed a
+singleton. What Phase 4 hadn't generalized was its own **test harness**:
+`crates/raft/tests/cluster.rs` hard-coded a single `1..=3` node cluster
+inline. That harness (`TestNode`, `spawn_cluster`, `wait_for_leader`, ...)
+is now extracted into `crates/raft/tests/common/mod.rs`, with
+`spawn_cluster` taking an explicit id list so a test can stand up several
+independent shards (e.g. shard A: `1..=3`, shard B: `11..=13`) — this is
+the actual "generalize Phase 4's single-group wiring to N groups" work.
+Each real shard replica still gets its own TCP address (no cluster-bus
+multiplexing of several shards over one port); that's deferred until real
+multi-node placement in Phase 7 needs it, not invented ahead of need.
 
-**Tests:** parallel-write test (writes to two different shards proceed
-independently; killing shard A's leader doesn't affect shard B's
-availability).
+**Tests:** 2 new tests in `crates/raft/tests/multi_shard.rs`:
+`test_parallel_writes_to_independent_shards` (two 3-node shard clusters
+spun up concurrently via `tokio::join!`, concurrent writes to each
+leader, and an explicit check that the same key on each shard never
+leaks the other shard's value) and
+`test_shard_leader_failure_does_not_affect_other_shard` (kill shard A's
+leader; shard B — no shared network link, directory, or Raft state —
+must immediately keep committing writes under its original leader and
+term, proving shard A's failure never reached it, while shard A
+independently elects a new leader and recovers on its own). Stable
+across 4 repeated runs.
 
-**Acceptance:** N-shard cluster where a single-shard failure is
-demonstrably isolated (per-shard test from `docs/testing.md`).
+**Acceptance:** met. `cargo build/test --workspace` clean (89 tests
+total), no new clippy warnings.
 
 ## Phase 7 — Cluster membership
 
