@@ -372,21 +372,64 @@ majority still can. Stable across 3 repeated runs.
 **Acceptance:** met. `cargo build/test --workspace` clean (103 tests
 total), no new clippy warnings.
 
-## Phase 8 — Failover
+## Phase 8 — Failover (done, with one item explicitly deferred)
 
 **Goal:** end-to-end failure detection -> election -> client redirection
 -> recovery -> catch-up, using the failure-injection harness from
 `docs/testing.md`.
 
-**Work:** build `crates/test-utils` (process-level crash/restart, network
-fault proxy) — does not exist in the prototype at all.
+**Work done:** new `crates/test-utils`:
+- `bin/test_node.rs`: a standalone process wrapping `raft::start_node` --
+  not a production binary (`crates/server` doesn't wire sharding/Raft
+  together yet), built solely so the harness can exercise real OS
+  processes. Exposes a small out-of-band admin TCP port (`admin.rs`'s
+  `AdminRequest`/`AdminResponse`: Propose/Get/Metrics) separate from the
+  Raft RPC port, so the test harness can drive a node without that
+  control traffic going anywhere near the Raft protocol itself.
+- `proxy.rs`: a *real* network-fault proxy. Since openraft's cluster
+  membership address for a peer is replicated (every node has the same
+  view of "node j's address"), a single shared proxy in front of node j
+  can't distinguish callers by source IP without extra plumbing. Instead,
+  each node process is launched with its own per-target dial override
+  (a small, independently-useful addition to `raft::network::Network`:
+  `with_overrides`, plus making `PartitionControl::is_blocked` `pub` for
+  reuse) pointing every peer at a link-specific proxy address that only
+  that one caller ever uses -- so each directed-link proxy inherently
+  knows both ends of the link it's gating, with no caller identification
+  needed. The proxy consults the exact same `PartitionControl` a test
+  drives directly, so `partition`/`heal` calls take effect on
+  already-running links in real time.
+- `process.rs`: real `SIGKILL` (via `Child::kill`) and real restart
+  (re-exec the same binary against the same `--dir`), plus a `free_port`
+  helper for picking real, fixed (not ephemeral-per-restart) ports.
 
-**Tests:** the full "critical distributed tests" list in
-`docs/testing.md`: leader crash, minority/majority partition, stale
-follower, repeated failures.
+**Tests:** `crates/test-utils/tests/failover.rs` -- the full docs/testing.md
+critical-tests list, now against three genuine OS processes and a real
+proxy layer instead of Phase 4's in-process simulation: leader crash +
+election + restart-and-catch-up, minority partition (isolated leader
+can't commit), majority partition (isolated single follower doesn't
+affect the majority), stale follower (catches up after being isolated
+during several writes, never leads with the stale log), and repeated
+leader failures (kill twice in a row, cluster still converges). Found and
+fixed a real flake: running with cargo's default parallel test threads
+caused port/timing contention across concurrently-spawned process
+clusters, fixed by serializing this file's test execution internally
+(a static `tokio::Mutex`) rather than relying on every future caller
+remembering `--test-threads=1`. Stable across repeated runs both
+serialized and under default parallelism afterward.
 
-**Acceptance:** every scenario in `docs/testing.md`'s critical-tests
-section passes against a real multi-process cluster, not a mocked one.
+**Deferred, explicitly:** "client redirection" from this phase's Goal is
+not implemented here. There is no real client-facing path yet from
+`crates/server`'s RESP layer to an actual shard's Raft group -- Phase 5's
+`SlotTable`/`MOVED` wiring in `crates/server` still points at a synthetic
+test fixture, not a real Raft-backed shard, and connecting those is its
+own integration effort not yet scheduled as a phase. Recorded here rather
+than silently claimed as done.
+
+**Acceptance:** met for the Raft-level scenarios docs/testing.md actually
+lists (leader crash, both partitions, stale follower, repeated failures)
+against real multi-process clusters. `cargo build/test --workspace`
+clean (108 tests total), no new clippy warnings.
 
 ## Phase 9 — Online resharding
 

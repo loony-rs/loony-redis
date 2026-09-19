@@ -85,7 +85,12 @@ impl PartitionControl {
         blocked.remove(&(b, a));
     }
 
-    async fn is_blocked(&self, from: NodeId, to: NodeId) -> bool {
+    /// Whether the link `from -> to` is currently cut. `pub` so a
+    /// separately-hosted fault-injection proxy (Phase 8's
+    /// `crates/test-utils`) can consult the exact same partition state a
+    /// test uses to drive `partition`/`heal`, rather than reimplementing
+    /// an equivalent table.
+    pub async fn is_blocked(&self, from: NodeId, to: NodeId) -> bool {
         self.blocked.read().await.contains(&(from, to))
     }
 }
@@ -93,6 +98,22 @@ impl PartitionControl {
 pub struct Network<C> {
     my_id: NodeId,
     links: Arc<PartitionControl>,
+    /// Per-target dial address overrides, consulted instead of the
+    /// address `node.addr` openraft's (cluster-wide, replicated)
+    /// membership carries for that target.
+    ///
+    /// This exists because `node.addr` is necessarily the same for every
+    /// node's view of a given peer -- it's committed Raft membership
+    /// data. A deployment that wants a *particular local node* to reach
+    /// a peer via a different path (a specific egress route, a NAT
+    /// traversal address, ...) can't express that through the
+    /// replicated address alone. `crates/test-utils`'s fault-injection
+    /// proxy (Phase 8) uses exactly this: each node process is given its
+    /// own override table pointing every peer at a dedicated per-link
+    /// proxy address, so the proxy for link (i, j) only ever serves
+    /// calls from i and needs no caller identification to apply
+    /// directional partition rules.
+    overrides: Arc<std::collections::HashMap<NodeId, String>>,
     _config: PhantomData<C>,
 }
 
@@ -101,6 +122,7 @@ impl<C> Clone for Network<C> {
         Network {
             my_id: self.my_id,
             links: self.links.clone(),
+            overrides: self.overrides.clone(),
             _config: PhantomData,
         }
     }
@@ -111,6 +133,24 @@ impl<C> Network<C> {
         Network {
             my_id,
             links,
+            overrides: Arc::new(std::collections::HashMap::new()),
+            _config: PhantomData,
+        }
+    }
+
+    /// Like `new`, but every RPC to `target` dials `overrides[target]`
+    /// instead of whatever address is in openraft's replicated
+    /// membership for that target, when an entry is present. See the
+    /// field doc comment on `Network::overrides`.
+    pub fn with_overrides(
+        my_id: NodeId,
+        links: Arc<PartitionControl>,
+        overrides: std::collections::HashMap<NodeId, String>,
+    ) -> Self {
+        Network {
+            my_id,
+            links,
+            overrides: Arc::new(overrides),
             _config: PhantomData,
         }
     }
@@ -123,10 +163,15 @@ where
     type Network = Connection<C>;
 
     async fn new_client(&mut self, target: NodeId, node: &Node) -> Self::Network {
+        let addr = self
+            .overrides
+            .get(&target)
+            .cloned()
+            .unwrap_or_else(|| node.addr.clone());
         Connection {
             from: self.my_id,
             target,
-            addr: node.addr.clone(),
+            addr,
             links: self.links.clone(),
             _config: PhantomData,
         }
