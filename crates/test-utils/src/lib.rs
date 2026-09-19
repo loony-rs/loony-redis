@@ -5,5 +5,6 @@
 //! Raft RPC port. See each module's doc comment.
 
 pub mod admin;
+pub mod node_metrics;
 pub mod process;
 pub mod proxy;

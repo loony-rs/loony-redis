@@ -507,7 +507,7 @@ part of section 51's acceptance test remains gated on the
 still-unscheduled crates/server integration noted above. `cargo build/
 test --workspace` clean (120 tests total), no new clippy warnings.
 
-## Phase 10 — Observability
+## Phase 10 — Observability (done)
 
 **Goal:** extend the reused Prometheus/`/health` skeleton with the full
 metric set and the three distinct health-endpoint semantics in
@@ -516,6 +516,84 @@ metric set and the three distinct health-endpoint semantics in
 **Acceptance:** every metric listed in `docs/observability.md` is
 scrapeable; `/live`, `/ready`, `/health` are distinguishable in a test
 that puts the node in each relevant state.
+
+**Work done:** rather than extending the legacy `src/observability/mod.rs`
+skeleton in place (it's wired to the old monolithic binary's
+`SharedCluster`/`Replication` types, which nothing new in this workspace
+uses), built a new `crates/metrics` crate holding the same
+hand-rolled-HTTP pattern generalized: a `Registry` (re-exports
+`prometheus` so callers don't need their own dependency line) and a
+`Health` flag type with independent `ready`/`healthy` bits, served over
+`/metrics`, `/live`, `/ready`, `/health`. `/live` needs no state at all —
+reaching the handler at all *is* the liveness check; `/ready` and
+`/health` each consult `Health`, and `/health` requires both flags (a
+node can be ready but not healthy, or vice versa — tested explicitly).
+
+Metrics landed at whichever layer actually has the real data, rather than
+faking labels on data nothing produces:
+- `persistence::Wal` gained `WalStats` (cumulative bytes written, fsync
+  count/duration) via a `stats()` accessor — plain numbers, no
+  `prometheus` dependency in a foundational crate.
+- `crates/raft` gained a `metrics` module: `snapshot()` derives
+  `GroupMetrics` (term, commit/applied index, per-follower replication
+  lag) from `openraft`'s own `RaftMetrics`, `watch_transitions()` diffs
+  consecutive snapshots off the metrics watch channel to derive
+  `leader_changes_total`/`elections_total` (not present in `RaftMetrics`
+  itself, which is a snapshot, not a counter of transitions), and
+  `is_group_healthy()` treats a known `current_leader` as the quorum
+  proxy for `/health`. All of it generic over any `RaftTypeConfig`, so it
+  works for both a shard's data group and the metadata group without
+  duplication.
+- `cluster::SlotTable` gained `ranges()`, coalescing contiguous
+  same-owner slots into `(start, end, shard, addr)` — the real shape
+  `CLUSTER SLOTS`/`NODES` need, not a hardcoded stand-in.
+- `crates/server` gained `ServerMetrics` (`requests_total`,
+  `requests_failed_total{command,error_kind}`,
+  `command_duration_seconds`, `connections_active`, `memory_used_bytes`
+  via a best-effort `/proc/self/statm` read, `cluster_nodes`/
+  `cluster_shards` derived from whatever `ClusterRouting` it holds) and
+  `CLUSTER INFO`/`SLOTS`/`NODES` commands built from `SlotTable::ranges()`
+  and `my_shard` — the only cluster-shaped state this crate has, since
+  it still isn't wired to a real membership/Raft group (the gap tracked
+  since Phase 8/9). No `RAFT INFO` here for the same reason — nothing in
+  this crate holds a Raft handle.
+- `test-utils`'s `test_node` binary is where `RAFT INFO`'s real
+  equivalent lives: `AdminRequest::Metrics`'s response gained
+  `commit_index`/`replication_lag` (previously just leader/term/applied
+  index), and a new optional `--metrics-addr` flag wires a full
+  `raft_*`/`wal_*` Prometheus registry (via the new `test_utils::
+  node_metrics::NodeMetrics`) plus `/live`/`/ready`/`/health` off a real
+  running Raft group with a real WAL — this is the one binary in the
+  workspace that actually runs both today, so it's where the metrics
+  could be proven real end-to-end rather than only unit-tested against
+  synthetic `RaftMetrics`/`WalStats` values. New integration test
+  `crates/test-utils/tests/observability.rs` spawns a real `test_node`
+  process, commits a real write, scrapes `/metrics` over a real HTTP
+  connection, and asserts `raft_term`/`raft_commit_index`/
+  `raft_applied_index`/`wal_bytes_written` are non-zero with the
+  `group_id="shard"` label, plus all three health endpoints return 200 —
+  and a second test confirms omitting `--metrics-addr` (every existing
+  `failover.rs` call site) really does skip the metrics server rather
+  than binding a silent default. `crates/server/src/main.rs` similarly
+  gained a `--metrics-addr` flag (default `127.0.0.1:9121`) wiring
+  `Server::registry()`/`Server::health()` into `metrics::serve`.
+
+Added ~29 new tests across `metrics` (7), `persistence` (2 WAL stats),
+`cluster` (3 `ranges()`), `raft` (3 `metrics` module), `server` (5:
+3 `CLUSTER` subcommands + 1 disabled-cluster + 1 end-to-end metrics/health
+over real HTTP), `test-utils` (3 `NodeMetrics` unit + 2 real-process
+`observability.rs` integration). `cargo fmt`/`clippy --all-targets`/
+`build --workspace`/`test --workspace` clean (149 tests total across the
+new-code workspace; no new clippy warnings — clippy findings in the
+legacy `src/` prototype predate this phase and are out of scope, per the
+reuse-not-rewrite decision in docs/architecture.md).
+
+**Deferred, tracked:** the same `crates/server`-not-wired-to-real-shards/
+membership gap noted in Phases 8/9 means `cluster_nodes` there is a
+proxy (distinct shard count in the local slot table, not a real
+membership-crate node count) and there's no `RAFT INFO` in `crates/server`
+itself — both become exact once that integration lands, which no phase
+currently owns.
 
 ## Phase 11 — Performance
 

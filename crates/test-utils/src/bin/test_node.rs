@@ -9,6 +9,7 @@ use clap::Parser;
 use std::collections::HashMap;
 use std::sync::Arc;
 use test_utils::admin::{to_io_err, AdminRequest, AdminResponse, MetricsSnapshot};
+use test_utils::node_metrics::NodeMetrics;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing_subscriber::EnvFilter;
@@ -40,6 +41,12 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     init: bool,
+
+    /// Serves `/metrics`, `/live`, `/ready`, `/health` (docs/observability.md).
+    /// Optional: existing call sites that omit it simply run without a
+    /// metrics endpoint.
+    #[arg(long)]
+    metrics_addr: Option<String>,
 }
 
 fn parse_map(s: &str) -> HashMap<u64, String> {
@@ -79,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
     let network = raft::Network::with_overrides(args.id, links, dial_overrides);
 
     let dir = std::path::PathBuf::from(&args.dir);
-    let (raft_handle, _log_store, state_machine) =
+    let (raft_handle, log_store, state_machine) =
         raft::start_node(args.id, &dir, config, network).await?;
 
     let raft_listener = TcpListener::bind(&args.raft_addr).await?;
@@ -87,6 +94,26 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         let _ = raft::network::serve(raft_listener, serve_raft).await;
     });
+
+    let health = Arc::new(metrics::Health::new());
+    if let Some(metrics_addr) = &args.metrics_addr {
+        let registry = metrics::Registry::new();
+        let node_metrics = NodeMetrics::new(&registry, "shard")?;
+        spawn_metrics_sampler(raft_handle.clone(), log_store.clone(), node_metrics.clone());
+        spawn_health_watcher(raft_handle.clone(), health.clone());
+        {
+            let leader_changes = node_metrics.clone();
+            let elections = node_metrics.clone();
+            raft::metrics::watch_transitions::<raft::TypeConfig>(
+                raft_handle.clone(),
+                move || leader_changes.raft_leader_changes_total.inc(),
+                move || elections.raft_elections_total.inc(),
+            );
+        }
+        let metrics_listener = TcpListener::bind(metrics_addr).await?;
+        metrics::serve(metrics_listener, registry, health.clone());
+    }
+    health.set_ready(true);
 
     if args.init {
         let raft_for_init = raft_handle.clone();
@@ -108,6 +135,48 @@ async fn main() -> anyhow::Result<()> {
 
     let admin_listener = TcpListener::bind(&args.admin_addr).await?;
     serve_admin(admin_listener, raft_handle, state_machine).await
+}
+
+/// Periodically copy this group's live Raft/WAL numbers into `node_metrics`
+/// (docs/observability.md's `raft_*`/`wal_*`) -- polling rather than
+/// pushing on every change since the WAL's counters aren't event-driven
+/// and a 500ms staleness bound is more than adequate for scraping.
+fn spawn_metrics_sampler(
+    raft: raft::Raft,
+    log_store: raft::LogStore,
+    node_metrics: Arc<NodeMetrics>,
+) {
+    tokio::spawn(async move {
+        let mut prev_wal = persistence::WalStats::default();
+        loop {
+            let m = raft.metrics().borrow().clone();
+            let gm = raft::metrics::snapshot::<raft::TypeConfig>(m.id, &m);
+            node_metrics.update_raft(m.current_term, &gm);
+
+            let curr_wal = log_store.wal_stats().await;
+            node_metrics.update_wal(prev_wal, curr_wal);
+            prev_wal = curr_wal;
+
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    });
+}
+
+/// Drive `/health` off this group's own quorum state (docs/observability.md:
+/// "for at least one shard it hosts, it can reach a quorum") -- reacts to
+/// the metrics watch channel directly rather than polling on a timer, so
+/// `/health` reflects a lost/regained leader without the sampler's delay.
+fn spawn_health_watcher(raft: raft::Raft, health: Arc<metrics::Health>) {
+    tokio::spawn(async move {
+        let mut rx = raft.metrics();
+        loop {
+            let healthy = raft::metrics::is_group_healthy::<raft::TypeConfig>(&rx.borrow());
+            health.set_healthy(healthy);
+            if rx.changed().await.is_err() {
+                break;
+            }
+        }
+    });
 }
 
 async fn serve_admin(
@@ -162,11 +231,14 @@ async fn handle_admin_conn(
         }
         AdminRequest::Metrics => {
             let m = raft.metrics().borrow().clone();
+            let gm = raft::metrics::snapshot::<raft::TypeConfig>(m.id, &m);
             AdminResponse::Metrics(MetricsSnapshot {
                 current_leader: m.current_leader,
                 current_term: m.current_term,
+                commit_index: gm.commit_index,
                 last_applied_index: m.last_applied.map(|l| l.index),
                 state: format!("{:?}", m.state),
+                replication_lag: gm.replication_lag.into_iter().collect(),
             })
         }
     };

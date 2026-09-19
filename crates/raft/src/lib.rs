@@ -9,6 +9,7 @@
 
 pub mod blob;
 pub mod log_store;
+pub mod metrics;
 pub mod network;
 mod state_machine;
 

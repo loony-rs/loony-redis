@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 protocol = { path = "../protocol" }
 storage = { path = "../storage" }
 cluster = { path = "../cluster" }
+metrics = { path = "../metrics" }
 
 [dev-dependencies]
 tokio-test = "0.4"

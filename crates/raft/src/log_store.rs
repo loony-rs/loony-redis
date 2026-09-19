@@ -84,6 +84,13 @@ where
         })
     }
 
+    /// This group's WAL byte/fsync counters (docs/observability.md's
+    /// `wal_bytes_written`/`wal_fsync_duration`) -- the caller attaches
+    /// its own `group_id` label, since this store doesn't know it.
+    pub async fn wal_stats(&self) -> persistence::WalStats {
+        self.inner.wal.lock().await.stats()
+    }
+
     async fn append_inner(
         &self,
         entries: impl IntoIterator<Item = openraft::Entry<C>>,

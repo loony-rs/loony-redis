@@ -15,12 +15,22 @@ pub enum AdminRequest {
     Metrics,
 }
 
+/// The `RAFT INFO` equivalent this out-of-band admin protocol exposes
+/// (docs/observability.md: "per group_id: term, leader, commit_index,
+/// applied_index, replication_lag per follower"). `test_node` only ever
+/// runs one group, so there's no `group_id` label here -- the field is
+/// meaningful once a binary hosts several groups (`crates/raft::metrics`
+/// already computes `group_id`-less values per group for that case).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsSnapshot {
     pub current_leader: Option<raft::NodeId>,
     pub current_term: u64,
+    pub commit_index: u64,
     pub last_applied_index: Option<u64>,
     pub state: String,
+    /// `(follower_node_id, lag)` -- empty unless this node is currently
+    /// the group's leader (see `raft::metrics::GroupMetrics`).
+    pub replication_lag: Vec<(raft::NodeId, u64)>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

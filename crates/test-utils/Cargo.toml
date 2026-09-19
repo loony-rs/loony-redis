@@ -11,6 +11,7 @@ path = "src/bin/test_node.rs"
 raft = { path = "../raft" }
 persistence = { path = "../persistence" }
 storage = { path = "../storage" }
+metrics = { path = "../metrics" }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

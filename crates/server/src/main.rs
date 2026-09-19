@@ -30,6 +30,10 @@ struct Args {
 
     #[arg(long, default_value_t = Limits::default().max_connections)]
     max_connections: usize,
+
+    /// Serves `/metrics`, `/live`, `/ready`, `/health` (docs/observability.md).
+    #[arg(long, default_value = "127.0.0.1:9121")]
+    metrics_addr: String,
 }
 
 #[tokio::main]
@@ -50,6 +54,14 @@ async fn main() -> anyhow::Result<()> {
 
     let store = Arc::new(Store::new());
     let server = Server::new(store, limits);
+
+    let metrics_listener = tokio::net::TcpListener::bind(&args.metrics_addr).await?;
+    tracing::info!(
+        "metrics http://{}/metrics  live/ready/health also served there",
+        args.metrics_addr
+    );
+    metrics::serve(metrics_listener, server.registry(), server.health());
+
     let addr = format!("{}:{}", args.host, args.port);
     server.run(&addr).await
 }

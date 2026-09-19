@@ -32,6 +32,19 @@ pub struct WalRecord {
     pub payload: Vec<u8>,
 }
 
+/// Cumulative counters for `wal_bytes_written`/`wal_fsync_duration`
+/// (docs/observability.md). Plain numbers, not `prometheus` types: this
+/// crate stays agnostic of any particular metrics backend, and doesn't
+/// know a caller's `group_id` label -- the caller (`raft::LogStore`,
+/// eventually `crates/server`) reads these and updates its own labeled
+/// metrics with them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WalStats {
+    pub bytes_written: u64,
+    pub fsync_count: u64,
+    pub fsync_duration_total: Duration,
+}
+
 /// Durability policy for `Wal::append` (docs/persistence.md).
 #[derive(Debug, Clone, Copy)]
 pub enum SyncPolicy {
@@ -50,6 +63,7 @@ pub struct Wal {
     next_index: u64,
     sync: SyncPolicy,
     last_fsync: Instant,
+    stats: WalStats,
 }
 
 impl Wal {
@@ -86,12 +100,31 @@ impl Wal {
             next_index,
             sync,
             last_fsync: Instant::now(),
+            stats: WalStats::default(),
         };
         Ok((wal, records))
     }
 
     pub fn next_index(&self) -> u64 {
         self.next_index
+    }
+
+    /// Cumulative bytes written and fsync count/duration since this
+    /// handle was opened (docs/observability.md's `wal_bytes_written`/
+    /// `wal_fsync_duration`) -- not since the file's creation, since a
+    /// fresh `Wal::open` after a restart has no way to recover counters
+    /// from a prior process.
+    pub fn stats(&self) -> WalStats {
+        self.stats
+    }
+
+    fn do_fsync(&mut self) -> io::Result<()> {
+        let start = Instant::now();
+        self.file.sync_data()?;
+        self.stats.fsync_count += 1;
+        self.stats.fsync_duration_total += start.elapsed();
+        self.last_fsync = Instant::now();
+        Ok(())
     }
 
     /// Discard every record with `index >= from_index`. Used when a
@@ -105,7 +138,11 @@ impl Wal {
 
         let tmp_path = self.path.with_extension("truncate_tmp");
         {
-            let mut tmp = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
+            let mut tmp = OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp_path)?;
             for r in records.iter().filter(|r| r.index < from_index) {
                 tmp.write_all(&encode_record(r.term, r.index, &r.payload))?;
             }
@@ -113,7 +150,11 @@ impl Wal {
         }
         std::fs::rename(&tmp_path, &self.path)?;
 
-        self.file = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&self.path)?;
         self.next_index = from_index;
         Ok(())
     }
@@ -124,16 +165,13 @@ impl Wal {
         let index = self.next_index;
         let buf = encode_record(term, index, payload);
         self.file.write_all(&buf)?;
+        self.stats.bytes_written += buf.len() as u64;
 
         match self.sync {
-            SyncPolicy::Always => {
-                self.file.sync_data()?;
-                self.last_fsync = Instant::now();
-            }
+            SyncPolicy::Always => self.do_fsync()?,
             SyncPolicy::Periodic(interval) => {
                 if self.last_fsync.elapsed() >= interval {
-                    self.file.sync_data()?;
-                    self.last_fsync = Instant::now();
+                    self.do_fsync()?;
                 }
             }
             SyncPolicy::Never => {}
@@ -147,9 +185,7 @@ impl Wal {
     /// of `Periodic`/`Never` appends as durable for an external purpose
     /// such as taking a snapshot).
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file.sync_data()?;
-        self.last_fsync = Instant::now();
-        Ok(())
+        self.do_fsync()
     }
 
     /// Discard every record with `index <= cutoff_index` (log compaction
@@ -380,6 +416,38 @@ mod tests {
         assert_eq!(records2.len(), 4);
         assert_eq!(records2[3].index, 3);
         assert_eq!(records2[3].payload, b"new");
+    }
+
+    #[test]
+    fn test_stats_track_bytes_written_and_fsync_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let (mut wal, _) = Wal::open(&path, SyncPolicy::Always).unwrap();
+        assert_eq!(wal.stats().bytes_written, 0);
+        assert_eq!(wal.stats().fsync_count, 0);
+
+        wal.append(1, b"hello").unwrap();
+        let stats = wal.stats();
+        assert_eq!(stats.bytes_written, (HEADER_LEN + 5 + CHECKSUM_LEN) as u64);
+        assert_eq!(stats.fsync_count, 1);
+
+        wal.append(1, b"world").unwrap();
+        let stats = wal.stats();
+        assert_eq!(
+            stats.bytes_written,
+            2 * (HEADER_LEN + 5 + CHECKSUM_LEN) as u64
+        );
+        assert_eq!(stats.fsync_count, 2);
+    }
+
+    #[test]
+    fn test_never_policy_does_not_increment_fsync_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let (mut wal, _) = Wal::open(&path, SyncPolicy::Never).unwrap();
+        wal.append(1, b"x").unwrap();
+        assert_eq!(wal.stats().fsync_count, 0);
+        assert!(wal.stats().bytes_written > 0);
     }
 
     #[test]

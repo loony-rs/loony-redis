@@ -10,12 +10,16 @@
 use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error};
 
 use protocol::{parse_frame, write_frame_into, Frame};
 use storage::{Store, Value};
+
+mod observability;
+pub use observability::ServerMetrics;
 
 // ── Limits (docs/protocol.md) ───────────────────────────────────────────────
 
@@ -58,6 +62,9 @@ pub struct Server {
     limits: Arc<Limits>,
     conn_count: Arc<AtomicUsize>,
     cluster: Arc<ClusterRouting>,
+    metrics: Arc<ServerMetrics>,
+    registry: metrics::Registry,
+    health: Arc<metrics::Health>,
 }
 
 /// This shard's routing identity. `slot_table` is `None` by default,
@@ -75,6 +82,9 @@ struct ClusterRouting {
 
 impl Server {
     pub fn new(store: Arc<Store>, limits: Limits) -> Self {
+        let registry = metrics::Registry::new();
+        let metrics = ServerMetrics::new(&registry)
+            .expect("metric registration cannot fail: names/labels are fixed and unique");
         Server {
             store,
             limits: Arc::new(limits),
@@ -83,6 +93,9 @@ impl Server {
                 my_shard: 0,
                 slot_table: None,
             }),
+            metrics,
+            registry,
+            health: Arc::new(metrics::Health::new()),
         }
     }
 
@@ -95,11 +108,37 @@ impl Server {
         my_shard: cluster::ShardId,
         slot_table: cluster::SlotTable,
     ) -> Self {
+        let mut shard_ids: Vec<_> = slot_table
+            .ranges()
+            .into_iter()
+            .map(|(_, _, shard, _)| shard)
+            .collect();
+        shard_ids.sort_unstable();
+        shard_ids.dedup();
+        self.metrics.cluster_shards.set(shard_ids.len() as i64);
+        self.metrics.cluster_nodes.set(shard_ids.len() as i64);
         self.cluster = Arc::new(ClusterRouting {
             my_shard,
             slot_table: Some(slot_table),
         });
         self
+    }
+
+    /// The Prometheus registry this server's metrics are registered
+    /// into -- pass to `metrics::serve` to expose `/metrics` (plus
+    /// `/live`/`/ready`/`/health` off `health()`) over HTTP.
+    pub fn registry(&self) -> metrics::Registry {
+        self.registry.clone()
+    }
+
+    /// Shared liveness/readiness handle -- see `metrics::Health`. This
+    /// server sets `ready`/`healthy` together once it starts accepting
+    /// connections (`serve`): `crates/server` alone has no deeper
+    /// dependency (WAL, Raft quorum) to distinguish "ready" from
+    /// "healthy" against -- that distinction becomes real once this
+    /// crate is wired to real shards (PLAN.md's tracked, deferred gap).
+    pub fn health(&self) -> Arc<metrics::Health> {
+        self.health.clone()
     }
 
     pub async fn run(self, addr: &str) -> anyhow::Result<()> {
@@ -111,6 +150,9 @@ impl Server {
     /// and learn the real address before serving.
     pub async fn serve(self, listener: TcpListener) -> anyhow::Result<()> {
         tracing::info!("listening on {}", listener.local_addr()?);
+        self.health.set_ready(true);
+        self.health.set_healthy(true);
+        spawn_memory_sampler(self.metrics.clone());
         loop {
             let (socket, peer) = listener.accept().await?;
 
@@ -126,11 +168,12 @@ impl Server {
             let store = self.store.clone();
             let limits = self.limits.clone();
             let cluster = self.cluster.clone();
-            let guard = ConnGuard::new(self.conn_count.clone());
+            let metrics = self.metrics.clone();
+            let guard = ConnGuard::new(self.conn_count.clone(), metrics.clone());
 
             tokio::spawn(async move {
                 let _guard = guard;
-                if let Err(e) = handle_connection(socket, store, limits, cluster).await {
+                if let Err(e) = handle_connection(socket, store, limits, cluster, metrics).await {
                     if !is_conn_reset(&e) {
                         error!("connection {peer} error: {e}");
                     }
@@ -141,18 +184,34 @@ impl Server {
     }
 }
 
-struct ConnGuard(Arc<AtomicUsize>);
+/// Refresh `memory_used_bytes` on a fixed interval rather than only when
+/// scraped, so a scrape always reads a recent value instead of paying the
+/// `/proc` read on the metrics server's own request path.
+fn spawn_memory_sampler(metrics: Arc<ServerMetrics>) {
+    tokio::spawn(async move {
+        loop {
+            if let Some(rss) = observability::read_rss_bytes() {
+                metrics.memory_used_bytes.set(rss);
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+struct ConnGuard(Arc<AtomicUsize>, Arc<ServerMetrics>);
 
 impl ConnGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
+    fn new(counter: Arc<AtomicUsize>, metrics: Arc<ServerMetrics>) -> Self {
         counter.fetch_add(1, Ordering::Relaxed);
-        ConnGuard(counter)
+        metrics.connections_active.inc();
+        ConnGuard(counter, metrics)
     }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
+        self.1.connections_active.dec();
     }
 }
 
@@ -174,6 +233,7 @@ async fn handle_connection(
     store: Arc<Store>,
     limits: Arc<Limits>,
     cluster: Arc<ClusterRouting>,
+    metrics: Arc<ServerMetrics>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(16 * 1024);
     let mut out = BytesMut::with_capacity(16 * 1024);
@@ -234,7 +294,7 @@ async fn handle_connection(
                         return Ok(());
                     }
 
-                    let response = dispatch(frame, &store, &limits, &cluster);
+                    let response = dispatch(frame, &store, &limits, &cluster, &metrics);
                     write_frame_into(&mut out, &response);
                 }
                 Ok(None) => break,
@@ -306,7 +366,13 @@ fn read_len_line(buf: &[u8], start: usize) -> Option<(i64, usize)> {
 
 // ── Command dispatch ─────────────────────────────────────────────────────
 
-fn dispatch(frame: Frame, store: &Store, limits: &Limits, cluster: &ClusterRouting) -> Frame {
+fn dispatch(
+    frame: Frame,
+    store: &Store,
+    limits: &Limits,
+    cluster: &ClusterRouting,
+    metrics: &ServerMetrics,
+) -> Frame {
     let args = match frame {
         Frame::Array(Some(a)) if !a.is_empty() => a,
         Frame::Array(Some(_)) => return Frame::error("ERR empty command"),
@@ -317,15 +383,28 @@ fn dispatch(frame: Frame, store: &Store, limits: &Limits, cluster: &ClusterRouti
         Some(b) => b.to_ascii_uppercase(),
         None => return Frame::error("ERR invalid command name"),
     };
+    let cmd_label = String::from_utf8_lossy(&cmd).into_owned();
+    let start = Instant::now();
+    let response = dispatch_inner(&cmd, &args, store, limits, cluster);
+    metrics.record(&cmd_label, &response, start.elapsed());
+    response
+}
 
+fn dispatch_inner(
+    cmd: &[u8],
+    args: &[Frame],
+    store: &Store,
+    limits: &Limits,
+    cluster: &ClusterRouting,
+) -> Frame {
     if let Some(table) = &cluster.slot_table {
-        let cmd_str = std::str::from_utf8(&cmd).unwrap_or("");
+        let cmd_str = std::str::from_utf8(cmd).unwrap_or("");
         // No migrations tracked here yet: crates/server isn't wired to a
         // real shard/metadata group (see PLAN.md Phase 8/9's explicitly
         // deferred integration note), so there is no live ClusterState
         // to source SlotMigration records from. The Ask arm exists so
         // the protocol-level behavior is in place ahead of that wiring.
-        match cluster::route(table, &[], cluster.my_shard, cmd_str, &args) {
+        match cluster::route(table, &[], cluster.my_shard, cmd_str, args) {
             cluster::RoutingDecision::Local => {}
             cluster::RoutingDecision::CrossSlot => return cluster::crossslot_error(),
             cluster::RoutingDecision::Moved { slot, leader_addr } => {
@@ -337,21 +416,22 @@ fn dispatch(frame: Frame, store: &Store, limits: &Limits, cluster: &ClusterRouti
         }
     }
 
-    match cmd.as_slice() {
-        b"PING" => cmd_ping(&args),
-        b"GET" => cmd_get(&args, store),
-        b"SET" => cmd_set(&args, store, limits),
-        b"DEL" => cmd_del(&args, store, limits),
-        b"LPUSH" => cmd_lpush(&args, store, limits),
-        b"RPUSH" => cmd_rpush(&args, store, limits),
-        b"LPOP" => cmd_lpop(&args, store, limits),
-        b"HSET" => cmd_hset(&args, store, limits),
-        b"HGET" => cmd_hget(&args, store, limits),
-        b"SADD" => cmd_sadd(&args, store, limits),
-        b"SMEMBERS" => cmd_smembers(&args, store, limits),
-        b"EXPIRE" => cmd_expire(&args, store, limits),
-        b"TTL" => cmd_ttl(&args, store, limits),
+    match cmd {
+        b"PING" => cmd_ping(args),
+        b"GET" => cmd_get(args, store),
+        b"SET" => cmd_set(args, store, limits),
+        b"DEL" => cmd_del(args, store, limits),
+        b"LPUSH" => cmd_lpush(args, store, limits),
+        b"RPUSH" => cmd_rpush(args, store, limits),
+        b"LPOP" => cmd_lpop(args, store, limits),
+        b"HSET" => cmd_hset(args, store, limits),
+        b"HGET" => cmd_hget(args, store, limits),
+        b"SADD" => cmd_sadd(args, store, limits),
+        b"SMEMBERS" => cmd_smembers(args, store, limits),
+        b"EXPIRE" => cmd_expire(args, store, limits),
+        b"TTL" => cmd_ttl(args, store, limits),
         b"INFO" => cmd_info(),
+        b"CLUSTER" => cmd_cluster(args, cluster),
         other => Frame::error(format!(
             "ERR unknown command `{}`",
             String::from_utf8_lossy(other)
@@ -412,6 +492,113 @@ fn cmd_ping(args: &[Frame]) -> Frame {
 
 fn cmd_info() -> Frame {
     Frame::bulk_str("# Server\r\nloony-redis-server:phase2\r\nrole:standalone\r\n")
+}
+
+// ── Cluster admin/debugging (docs/observability.md's "Admin / debugging") ──
+//
+// `CLUSTER SLOTS`/`NODES`/`INFO` report exactly what `ClusterRouting`
+// holds -- the slot table this server was constructed with. There's no
+// membership crate wired in here (the deferred crates/server integration
+// gap tracked since Phase 8/9), so "known nodes" is approximated as the
+// distinct shard count in the slot table; a real node registry would
+// give an exact figure instead. `RAFT INFO` has no equivalent here since
+// this crate holds no Raft handle at all -- see `test-utils`'s
+// `test_node` admin protocol for that, where a real Raft group runs.
+
+fn cmd_cluster(args: &[Frame], cluster: &ClusterRouting) -> Frame {
+    let sub = match bulk_bytes(args, 1) {
+        Some(b) => b.to_ascii_uppercase(),
+        None => return wrong_num_args("cluster"),
+    };
+    match sub.as_slice() {
+        b"INFO" => cmd_cluster_info(cluster),
+        b"SLOTS" => cmd_cluster_slots(cluster),
+        b"NODES" => cmd_cluster_nodes(cluster),
+        other => Frame::error(format!(
+            "ERR unknown CLUSTER subcommand `{}`",
+            String::from_utf8_lossy(other)
+        )),
+    }
+}
+
+fn shard_ids(ranges: &[(u16, u16, cluster::ShardId, String)]) -> Vec<cluster::ShardId> {
+    let mut ids: Vec<_> = ranges.iter().map(|(_, _, shard, _)| *shard).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn cmd_cluster_info(cluster: &ClusterRouting) -> Frame {
+    let enabled = cluster.slot_table.is_some();
+    let ranges = cluster
+        .slot_table
+        .as_ref()
+        .map(|t| t.ranges())
+        .unwrap_or_default();
+    let assigned: u32 = ranges.iter().map(|(s, e, _, _)| (*e - *s + 1) as u32).sum();
+    let known_shards = shard_ids(&ranges).len();
+    Frame::bulk_str(format!(
+        "cluster_enabled:{}\r\n\
+         cluster_state:ok\r\n\
+         cluster_slots_assigned:{}\r\n\
+         cluster_known_nodes:{}\r\n\
+         cluster_size:{}\r\n\
+         cluster_my_shard:{}\r\n",
+        enabled as u8, assigned, known_shards, known_shards, cluster.my_shard
+    ))
+}
+
+/// Split `"host:port"` into its parts; falls back to `(addr, 0)` if `addr`
+/// doesn't have a parseable trailing port (defensive only -- every
+/// `SlotTable` entry in this codebase is populated from a real listen
+/// address).
+fn split_host_port(addr: &str) -> (&str, u16) {
+    match addr.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse().unwrap_or(0)),
+        None => (addr, 0),
+    }
+}
+
+fn cmd_cluster_slots(cluster: &ClusterRouting) -> Frame {
+    let ranges = match &cluster.slot_table {
+        Some(t) => t.ranges(),
+        None => return Frame::array(vec![]),
+    };
+    let entries = ranges
+        .into_iter()
+        .map(|(start, end, shard, addr)| {
+            let (host, port) = split_host_port(&addr);
+            Frame::array(vec![
+                Frame::integer(start as i64),
+                Frame::integer(end as i64),
+                Frame::array(vec![
+                    Frame::bulk_str(host),
+                    Frame::integer(port as i64),
+                    Frame::bulk_str(format!("shard-{shard}")),
+                ]),
+            ])
+        })
+        .collect();
+    Frame::array(entries)
+}
+
+fn cmd_cluster_nodes(cluster: &ClusterRouting) -> Frame {
+    let ranges = match &cluster.slot_table {
+        Some(t) => t.ranges(),
+        None => return Frame::bulk_str(""),
+    };
+    let mut lines = String::new();
+    for (start, end, shard, addr) in ranges {
+        let flags = if shard == cluster.my_shard {
+            "myself,master"
+        } else {
+            "master"
+        };
+        lines.push_str(&format!(
+            "shard-{shard} {addr} {flags} - 0 0 0 connected {start}-{end}\n"
+        ));
+    }
+    Frame::bulk_str(lines)
 }
 
 // ── Strings ──────────────────────────────────────────────────────────────
@@ -958,6 +1145,130 @@ mod tests {
         let resp = read_response(&mut sock).await;
         let s = String::from_utf8_lossy(&resp);
         assert!(s.starts_with("-CROSSSLOT"), "unexpected: {s}");
+    }
+
+    fn two_shard_table() -> cluster::SlotTable {
+        let mut table = cluster::SlotTable::new();
+        table.set_owner(0..=(cluster::SLOT_COUNT / 2 - 1), 1, "127.0.0.1:7001");
+        table.set_owner(
+            (cluster::SLOT_COUNT / 2)..=(cluster::SLOT_COUNT - 1),
+            2,
+            "127.0.0.1:7002",
+        );
+        table
+    }
+
+    #[tokio::test]
+    async fn test_cluster_info_reports_slot_and_shard_counts() {
+        let addr = start_routed_test_server(1, two_shard_table()).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*2\r\n$7\r\nCLUSTER\r\n$4\r\nINFO\r\n")
+            .await
+            .unwrap();
+        let resp = read_response(&mut sock).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.contains("cluster_enabled:1"), "unexpected: {s}");
+        assert!(
+            s.contains(&format!("cluster_slots_assigned:{}", cluster::SLOT_COUNT)),
+            "unexpected: {s}"
+        );
+        assert!(s.contains("cluster_known_nodes:2"), "unexpected: {s}");
+        assert!(s.contains("cluster_my_shard:1"), "unexpected: {s}");
+    }
+
+    #[tokio::test]
+    async fn test_cluster_slots_returns_owned_ranges() {
+        let addr = start_routed_test_server(1, two_shard_table()).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n")
+            .await
+            .unwrap();
+        let resp = read_response(&mut sock).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(s.starts_with("*2\r\n"), "expected two ranges, got: {s}");
+        assert!(s.contains("127.0.0.1"), "unexpected: {s}");
+        assert!(s.contains("7001") && s.contains("7002"), "unexpected: {s}");
+    }
+
+    #[tokio::test]
+    async fn test_cluster_nodes_marks_this_shard_as_myself() {
+        let addr = start_routed_test_server(1, two_shard_table()).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nNODES\r\n")
+            .await
+            .unwrap();
+        let resp = read_response(&mut sock).await;
+        let s = String::from_utf8_lossy(&resp);
+        assert!(
+            s.contains("shard-1 127.0.0.1:7001 myself,master"),
+            "unexpected: {s}"
+        );
+        assert!(
+            s.contains("shard-2 127.0.0.1:7002 master"),
+            "unexpected: {s}"
+        );
+        assert!(
+            !s.contains("shard-2 127.0.0.1:7002 myself"),
+            "unexpected: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_disabled_returns_empty_results() {
+        let (addr, _store) = start_test_server(Limits::default()).await;
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*2\r\n$7\r\nCLUSTER\r\n$5\r\nSLOTS\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_response(&mut sock).await, b"*0\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_and_health_endpoints_served_over_http() {
+        let store = Arc::new(Store::new());
+        let server = Server::new(store, Limits::default());
+        let registry = server.registry();
+        let health = server.health();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(server.serve(listener));
+
+        // `serve` marks the node ready/healthy as soon as it starts
+        // accepting -- give the spawned task a moment to run.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(health.is_ready());
+        assert!(health.is_healthy());
+
+        let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let metrics_addr = metrics_listener.local_addr().unwrap();
+        metrics::serve(metrics_listener, registry, health);
+
+        // Drive one real command through the RESP port so requests_total
+        // has a sample, then confirm it shows up on /metrics.
+        let mut sock = TcpStream::connect(addr).await.unwrap();
+        sock.write_all(b"*1\r\n$4\r\nPING\r\n").await.unwrap();
+        let _ = read_response(&mut sock).await;
+
+        let mut mstream = TcpStream::connect(metrics_addr).await.unwrap();
+        mstream
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 8192];
+        let n = mstream.read(&mut buf).await.unwrap();
+        let body = String::from_utf8_lossy(&buf[..n]);
+        assert!(body.contains("200 OK"), "unexpected: {body}");
+        assert!(body.contains("requests_total"), "unexpected: {body}");
+        assert!(body.contains("command=\"PING\""), "unexpected: {body}");
+
+        let mut lstream = TcpStream::connect(metrics_addr).await.unwrap();
+        lstream
+            .write_all(b"GET /health HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let n = lstream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("200 OK"));
     }
 
     #[test]

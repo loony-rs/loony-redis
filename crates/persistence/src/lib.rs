@@ -11,7 +11,7 @@ mod wal;
 
 pub use command::{apply, Command};
 pub use snapshot::{load_latest_snapshot, save_snapshot, Snapshot, SnapshotMetadata};
-pub use wal::{SyncPolicy, Wal, WalRecord};
+pub use wal::{SyncPolicy, Wal, WalRecord, WalStats};
 
 use std::path::Path;
 use storage::Store;

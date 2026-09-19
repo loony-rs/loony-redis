@@ -117,6 +117,41 @@ impl SlotTable {
     pub fn owner(&self, slot: u16) -> Option<&(ShardId, String)> {
         self.owners[slot as usize].as_ref()
     }
+
+    /// Coalesce owned slots into contiguous `(start, end, shard,
+    /// leader_addr)` ranges, in slot order -- the shape `CLUSTER SLOTS`/
+    /// `CLUSTER NODES` need (docs/observability.md's admin/debugging
+    /// section). Unowned slots are simply absent, not reported as a range
+    /// with a placeholder owner.
+    pub fn ranges(&self) -> Vec<(u16, u16, ShardId, String)> {
+        let mut out = Vec::new();
+        let mut current: Option<(u16, u16, ShardId, String)> = None;
+        for (slot, owner) in self.owners.iter().enumerate() {
+            let slot = slot as u16;
+            match (owner, &mut current) {
+                (Some((shard, addr)), Some((_, end, cur_shard, cur_addr)))
+                    if *cur_shard == *shard && cur_addr == addr && *end + 1 == slot =>
+                {
+                    *end = slot;
+                }
+                (Some((shard, addr)), _) => {
+                    if let Some(r) = current.take() {
+                        out.push(r);
+                    }
+                    current = Some((slot, slot, *shard, addr.clone()));
+                }
+                (None, _) => {
+                    if let Some(r) = current.take() {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        if let Some(r) = current {
+            out.push(r);
+        }
+        out
+    }
 }
 
 impl Default for SlotTable {
@@ -346,6 +381,42 @@ mod tests {
                 slot,
                 leader_addr: "127.0.0.1:7001".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn test_ranges_empty_table_has_no_ranges() {
+        let table = SlotTable::new();
+        assert!(table.ranges().is_empty());
+    }
+
+    #[test]
+    fn test_ranges_coalesces_contiguous_same_owner_slots() {
+        let mut table = SlotTable::new();
+        table.set_owner(0..=99, 1, "127.0.0.1:7001");
+        table.set_owner(100..=199, 2, "127.0.0.1:7002");
+        let ranges = table.ranges();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, 99, 1, "127.0.0.1:7001".to_string()),
+                (100, 199, 2, "127.0.0.1:7002".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ranges_splits_on_gap_even_with_same_owner() {
+        let mut table = SlotTable::new();
+        table.set_owner(0..=9, 1, "127.0.0.1:7001");
+        table.set_owner(20..=29, 1, "127.0.0.1:7001");
+        let ranges = table.ranges();
+        assert_eq!(
+            ranges,
+            vec![
+                (0, 9, 1, "127.0.0.1:7001".to_string()),
+                (20, 29, 1, "127.0.0.1:7001".to_string()),
+            ]
         );
     }
 
