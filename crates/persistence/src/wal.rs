@@ -94,6 +94,30 @@ impl Wal {
         self.next_index
     }
 
+    /// Discard every record with `index >= from_index`. Used when a
+    /// follower's log conflicts with a new leader's and must be rolled
+    /// back to a common prefix before the leader's entries are appended
+    /// (docs/persistence.md's second truncation case). Symmetric to
+    /// `compact_before`, which discards a covered prefix instead.
+    pub fn truncate_from(&mut self, from_index: u64) -> io::Result<()> {
+        let existing = std::fs::read(&self.path)?;
+        let (records, _valid_len) = scan(&existing);
+
+        let tmp_path = self.path.with_extension("truncate_tmp");
+        {
+            let mut tmp = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
+            for r in records.iter().filter(|r| r.index < from_index) {
+                tmp.write_all(&encode_record(r.term, r.index, &r.payload))?;
+            }
+            tmp.sync_all()?;
+        }
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        self.file = OpenOptions::new().create(true).append(true).read(true).open(&self.path)?;
+        self.next_index = from_index;
+        Ok(())
+    }
+
     /// Append one record and apply the configured fsync policy. Returns
     /// the assigned index.
     pub fn append(&mut self, term: u64, payload: &[u8]) -> io::Result<u64> {
@@ -330,6 +354,32 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].index, 3);
         assert_eq!(records[1].index, 4);
+    }
+
+    #[test]
+    fn test_truncate_from_discards_only_the_conflicting_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut wal = {
+            let (wal, _) = Wal::open(&path, SyncPolicy::Always).unwrap();
+            wal
+        };
+        for i in 0..5u8 {
+            wal.append(1, &[i]).unwrap();
+        }
+        wal.truncate_from(3).unwrap(); // drop index 3,4 -- keep 0,1,2
+
+        let (_wal2, records) = Wal::open(&path, SyncPolicy::Always).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2].index, 2);
+
+        // Appending after truncation must resume at the truncation point,
+        // not at the old next_index, or it would leave a gap.
+        wal.append(2, b"new").unwrap();
+        let (_wal3, records2) = Wal::open(&path, SyncPolicy::Always).unwrap();
+        assert_eq!(records2.len(), 4);
+        assert_eq!(records2[3].index, 3);
+        assert_eq!(records2[3].payload, b"new");
     }
 
     #[test]

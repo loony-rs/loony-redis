@@ -187,25 +187,65 @@ follower crash specifically -- wait for Phase 4, since there's no leader/
 follower distinction without Raft yet). `cargo build/test --workspace`
 clean (55 tests total), zero clippy warnings introduced by this phase.
 
-## Phase 4 — Raft (single shard)
+## Phase 4 — Raft (single shard) (done)
 
 **Goal:** integrate `openraft` (decision 0001) for one Raft group, wire
 `RaftLogStorage`/`RaftStateMachine` to the Phase 3 WAL and Phase 1 storage,
-`RaftNetwork` over internal TCP. Delete `src/consensus/mod.rs`.
+`RaftNetwork` over internal TCP.
 
-**Work:** per `docs/raft.md`. Every write now goes through
-propose->commit->apply->ack (decision 0004 — no parallel weak-replication
-path is ever added).
+**Work done:**
+- New `crates/raft`, depending on `openraft = "0.9"` (`serde` +
+  `storage-v2` features — v2 is the current, non-deprecated split-trait
+  API; `storage-v2` also unseals `RaftLogStorage`/`RaftStateMachine` for
+  a third-party impl like this one). `TypeConfig` declared via
+  `openraft::declare_raft_types!` with `D = persistence::Command`,
+  `R = ()`, `NodeId = u64`, `Node = openraft::BasicNode`.
+- `LogStore` (`RaftLogStorage` + `RaftLogReader`): entries are served from
+  an in-memory `BTreeMap<index, Vec<u8>>` rebuilt from `persistence::Wal`
+  on open; writes go through the same `Wal`, with an explicit `flush()`
+  before invoking openraft's `LogFlushed` callback so the callback's
+  durability contract is honored regardless of `Wal`'s own fsync policy.
+  `Wal` gained a new `truncate_from` (discard a conflicting suffix) to
+  pair with Phase 3's `compact_before` (discard a covered prefix) —
+  `truncate`/`purge` map onto these directly. `vote` and the
+  purged-log-id boundary each get their own tiny checksummed file
+  (`crate::blob`) since WAL records have no slot for them.
+- `StateMachineStore` (`RaftStateMachine` + `RaftSnapshotBuilder`, on
+  `Arc<StateMachineStore>` per openraft's own reference pattern so the
+  RESP server can later hold a clone for direct leader reads without
+  going through Raft): `apply` calls the exact `persistence::Command`
+  apply function Phase 3 already built and tested. Snapshots are a new,
+  small format specific to this crate (openraft's `SnapshotMeta` plus a
+  bincode-serialized `Vec<storage::KeyEntry>`), not a reuse of
+  `persistence::Snapshot` (that format doesn't carry openraft's
+  membership/log-id metadata).
+- `Network`/`Connection` (`RaftNetworkFactory` + `RaftNetwork`): real TCP,
+  a fresh connection per RPC, length-prefixed bincode frames. Includes
+  `PartitionControl`, a shared blocked-link table gating outbound
+  connection attempts — the mechanism this phase's partition tests use to
+  simulate a cut without building Phase 8's full fault-injection harness;
+  a blocked link fails as `Unreachable`, same as a real dead peer.
+- The legacy `src/consensus/mod.rs` (hand-rolled, in-memory-only Raft) is
+  **not yet deleted** — it still backs the old prototype binary, which
+  remains untouched, matching how Phase 2 left `src/network`/
+  `src/commands` alone. It gets retired once a later phase gives
+  `crates/server` real parity (sharding + this Raft crate wired
+  together) and the old binary is finally replaced, not before.
 
-**Tests:** three-node replication (SET on leader, GET on followers via
-`READ FROM REPLICA`), leader crash -> election -> continued writes,
-minority/majority partition scenarios from `docs/failure-model.md`
-(first real distributed-fault tests in the project — the prototype had
-none for consensus).
+**Tests:** 7 unit tests (`crates/raft/src`: WAL-backed log
+append/read/reopen, truncate-conflicting-suffix, purge-and-reopen, vote
+persistence; state-machine apply, snapshot build/install round-trip,
+snapshot-survives-reopen) plus 4 real integration tests
+(`crates/raft/tests/cluster.rs`), each a genuine 3-node cluster over real
+localhost TCP with on-disk WAL/snapshot per node:
+`test_three_node_replication`, `test_leader_crash_election_continues_and_rejoin_catches_up`
+(kill -> new election -> continued writes -> rejoin at the same address
+and disk -> catch-up), `test_minority_partition_isolated_leader_cannot_commit`,
+`test_majority_partition_continues_without_isolated_follower`. Verified
+stable across 5 repeated runs (no flakiness observed).
 
-**Acceptance:** the leader-crash and partition tests in
-`docs/testing.md`'s "critical distributed tests" section pass for a
-single shard.
+**Acceptance:** met for a single shard. `cargo build/test --workspace`
+clean (67 tests total), zero clippy warnings on the new crate.
 
 ## Phase 5 — Sharding
 

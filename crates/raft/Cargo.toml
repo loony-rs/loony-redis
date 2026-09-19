@@ -1,0 +1,21 @@
+[package]
+name = "raft"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+openraft = { version = "0.9", features = ["serde", "storage-v2"] }
+storage = { path = "../storage" }
+persistence = { path = "../persistence" }
+tokio = { version = "1", features = ["full"] }
+bytes = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+crc32c = "0.6"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
