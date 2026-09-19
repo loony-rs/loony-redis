@@ -131,30 +131,61 @@ pub enum RoutingDecision {
     Local,
     /// Another shard owns this slot -- reply `-MOVED`.
     Moved { slot: u16, leader_addr: String },
+    /// This slot is mid-`Cutover` and this node is the migration
+    /// source -- reply `-ASK` (docs/resharding.md). The client must
+    /// send `ASKING` then retry against `leader_addr` without updating
+    /// its long-term routing cache.
+    Ask { slot: u16, leader_addr: String },
     /// The command's keys span more than one slot -- reply `-CROSSSLOT`.
     CrossSlot,
 }
 
 /// Decide how `my_shard` should handle `cmd`/`args` given the current
-/// `table`. A slot with no recorded owner defaults to `Local` -- see the
-/// module doc comment for why (no Phase 7 metadata group yet).
-pub fn route(table: &SlotTable, my_shard: ShardId, cmd: &str, args: &[Frame]) -> RoutingDecision {
+/// `table` and any in-flight `migrations`. A slot with no recorded owner
+/// defaults to `Local` -- see the module doc comment for why (no Phase 7
+/// metadata group yet, for callers that don't have one).
+///
+/// Per docs/resharding.md, `Preparing`/`Transferring`/`CatchingUp` change
+/// nothing about routing -- the source is still fully authoritative.
+/// Only `Cutover` changes behavior, and only for the source: it replies
+/// `-ASK` instead of serving the request itself.
+pub fn route(
+    table: &SlotTable,
+    migrations: &[crate::SlotMigration],
+    my_shard: ShardId,
+    cmd: &str,
+    args: &[Frame],
+) -> RoutingDecision {
     match command_slot(cmd, args) {
         CommandSlot::None => RoutingDecision::Local,
         CommandSlot::CrossSlot => RoutingDecision::CrossSlot,
-        CommandSlot::Slot(slot) => match table.owner(slot) {
-            None => RoutingDecision::Local,
-            Some((shard, _)) if *shard == my_shard => RoutingDecision::Local,
-            Some((_, addr)) => RoutingDecision::Moved {
-                slot,
-                leader_addr: addr.clone(),
-            },
-        },
+        CommandSlot::Slot(slot) => {
+            if let Some(m) = crate::migration_for_slot(migrations, slot) {
+                if m.state == crate::MigrationState::Cutover && m.source == my_shard {
+                    return RoutingDecision::Ask {
+                        slot,
+                        leader_addr: m.target_leader_addr.clone(),
+                    };
+                }
+            }
+            match table.owner(slot) {
+                None => RoutingDecision::Local,
+                Some((shard, _)) if *shard == my_shard => RoutingDecision::Local,
+                Some((_, addr)) => RoutingDecision::Moved {
+                    slot,
+                    leader_addr: addr.clone(),
+                },
+            }
+        }
     }
 }
 
 pub fn moved_error(slot: u16, leader_addr: &str) -> Frame {
     Frame::error(format!("MOVED {slot} {leader_addr}"))
+}
+
+pub fn ask_error(slot: u16, leader_addr: &str) -> Frame {
+    Frame::error(format!("ASK {slot} {leader_addr}"))
 }
 
 pub fn crossslot_error() -> Frame {
@@ -207,7 +238,7 @@ mod tests {
     fn test_route_local_by_default_when_slot_unowned() {
         let table = SlotTable::new();
         let a = args(&["GET", "foo"]);
-        assert_eq!(route(&table, 1, "GET", &a), RoutingDecision::Local);
+        assert_eq!(route(&table, &[], 1, "GET", &a), RoutingDecision::Local);
     }
 
     #[test]
@@ -216,7 +247,7 @@ mod tests {
         let slot = slot_for_key(b"foo");
         table.set_owner(slot..=slot, 1, "127.0.0.1:7001");
         let a = args(&["GET", "foo"]);
-        assert_eq!(route(&table, 1, "GET", &a), RoutingDecision::Local);
+        assert_eq!(route(&table, &[], 1, "GET", &a), RoutingDecision::Local);
     }
 
     #[test]
@@ -226,7 +257,7 @@ mod tests {
         table.set_owner(slot..=slot, 2, "127.0.0.1:7002");
         let a = args(&["GET", "foo"]);
         assert_eq!(
-            route(&table, 1, "GET", &a),
+            route(&table, &[], 1, "GET", &a),
             RoutingDecision::Moved {
                 slot,
                 leader_addr: "127.0.0.1:7002".to_string()
@@ -238,7 +269,93 @@ mod tests {
     fn test_route_crossslot_regardless_of_ownership() {
         let table = SlotTable::new();
         let a = args(&["DEL", "foo", "bar"]);
-        assert_eq!(route(&table, 1, "DEL", &a), RoutingDecision::CrossSlot);
+        assert_eq!(route(&table, &[], 1, "DEL", &a), RoutingDecision::CrossSlot);
+    }
+
+    #[test]
+    fn test_route_ask_when_source_mid_cutover() {
+        let mut table = SlotTable::new();
+        let slot = slot_for_key(b"foo");
+        table.set_owner(slot..=slot, 1, "127.0.0.1:7001");
+        let migrations = vec![crate::SlotMigration {
+            start: slot,
+            end: slot,
+            source: 1,
+            target: 2,
+            target_leader_addr: "127.0.0.1:7002".to_string(),
+            state: crate::MigrationState::Cutover,
+        }];
+        let a = args(&["GET", "foo"]);
+        assert_eq!(
+            route(&table, &migrations, 1, "GET", &a),
+            RoutingDecision::Ask {
+                slot,
+                leader_addr: "127.0.0.1:7002".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_route_unaffected_by_migration_before_cutover() {
+        // Preparing/Transferring/CatchingUp must not change routing --
+        // the source stays fully authoritative until Cutover.
+        let mut table = SlotTable::new();
+        let slot = slot_for_key(b"foo");
+        table.set_owner(slot..=slot, 1, "127.0.0.1:7001");
+        for state in [
+            crate::MigrationState::Preparing,
+            crate::MigrationState::Transferring,
+            crate::MigrationState::CatchingUp,
+        ] {
+            let migrations = vec![crate::SlotMigration {
+                start: slot,
+                end: slot,
+                source: 1,
+                target: 2,
+                target_leader_addr: "127.0.0.1:7002".to_string(),
+                state,
+            }];
+            let a = args(&["GET", "foo"]);
+            assert_eq!(
+                route(&table, &migrations, 1, "GET", &a),
+                RoutingDecision::Local,
+                "state {state:?} must not affect routing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_route_cutover_does_not_affect_the_target() {
+        // The target isn't the source, so it must not itself start
+        // answering ASK for a slot it doesn't yet own.
+        let mut table = SlotTable::new();
+        let slot = slot_for_key(b"foo");
+        table.set_owner(slot..=slot, 1, "127.0.0.1:7001");
+        let migrations = vec![crate::SlotMigration {
+            start: slot,
+            end: slot,
+            source: 1,
+            target: 2,
+            target_leader_addr: "127.0.0.1:7002".to_string(),
+            state: crate::MigrationState::Cutover,
+        }];
+        let a = args(&["GET", "foo"]);
+        assert_eq!(
+            route(&table, &migrations, 2, "GET", &a),
+            RoutingDecision::Moved {
+                slot,
+                leader_addr: "127.0.0.1:7001".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_ask_error_format() {
+        let f = ask_error(42, "127.0.0.1:7002");
+        match f {
+            Frame::Error(s) => assert_eq!(s, "ASK 42 127.0.0.1:7002"),
+            _ => panic!("expected error frame"),
+        }
     }
 
     #[test]

@@ -33,6 +33,10 @@ use crate::{command, MetaTypeConfig};
 pub struct ClusterState {
     pub nodes: BTreeMap<NodeIdentity, String>,
     pub slots: cluster::SlotTable,
+    /// In-flight slot migrations (docs/resharding.md), keyed implicitly
+    /// by their `(start, end)` range -- see `MetaCommand`'s migration
+    /// variants for how these are created/advanced/removed.
+    pub migrations: Vec<cluster::SlotMigration>,
 }
 
 impl ClusterState {

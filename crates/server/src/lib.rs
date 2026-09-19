@@ -320,11 +320,19 @@ fn dispatch(frame: Frame, store: &Store, limits: &Limits, cluster: &ClusterRouti
 
     if let Some(table) = &cluster.slot_table {
         let cmd_str = std::str::from_utf8(&cmd).unwrap_or("");
-        match cluster::route(table, cluster.my_shard, cmd_str, &args) {
+        // No migrations tracked here yet: crates/server isn't wired to a
+        // real shard/metadata group (see PLAN.md Phase 8/9's explicitly
+        // deferred integration note), so there is no live ClusterState
+        // to source SlotMigration records from. The Ask arm exists so
+        // the protocol-level behavior is in place ahead of that wiring.
+        match cluster::route(table, &[], cluster.my_shard, cmd_str, &args) {
             cluster::RoutingDecision::Local => {}
             cluster::RoutingDecision::CrossSlot => return cluster::crossslot_error(),
             cluster::RoutingDecision::Moved { slot, leader_addr } => {
                 return cluster::moved_error(slot, &leader_addr);
+            }
+            cluster::RoutingDecision::Ask { slot, leader_addr } => {
+                return cluster::ask_error(slot, &leader_addr);
             }
         }
     }

@@ -431,18 +431,81 @@ lists (leader crash, both partitions, stale follower, repeated failures)
 against real multi-process clusters. `cargo build/test --workspace`
 clean (108 tests total), no new clippy warnings.
 
-## Phase 9 — Online resharding
+## Phase 9 — Online resharding (done, with one gap explicitly deferred)
 
 **Goal:** the full PREPARING->TRANSFERRING->CATCHING_UP->CUTOVER->
 COMPLETED state machine from `docs/resharding.md`, replacing the
 prototype's unstaged copy-then-flip.
 
-**Tests:** full migration cycle with continuous reads/writes against the
-migrating range throughout; kill-source-mid-transfer and
-kill-target-mid-catch-up scenarios with verified convergence.
+**Work done:**
+- `crates/cluster` gains `SlotMigration`/`MigrationState` (Preparing/
+  Transferring/CatchingUp/Cutover -- no separate `Completed` variant,
+  since per docs/resharding.md completing a migration is the same
+  replicated command that updates `SlotTable` ownership and removes the
+  record, so "completed" is just the record's absence) and a `-ASK`
+  `RoutingDecision`. `route()` is migration-aware: per
+  docs/resharding.md, `Preparing`/`Transferring`/`CatchingUp` change
+  nothing about routing (source stays fully authoritative); only
+  `Cutover` does, and only for the source, which replies `-ASK` instead
+  of serving the request.
+- `crates/membership` extends `ClusterState`/`MetaCommand` with
+  `StartMigration`/`AdvanceMigration`/`CompleteMigration`.
+  `CompleteMigration` is deliberately one atomic command doing both the
+  ownership handoff and the record removal, so there is never a moment
+  with an unowned or ambiguously-owned slot (invariant S6/T1).
+- New `crates/resharding`: `rpc.rs` is the actual data-transfer
+  mechanism -- a real RPC (`GetRangeSnapshot`) any replica of the source
+  shard can serve, since a reply from a lagging follower only costs the
+  coordinator another sync pass, never correctness. `coordinator.rs`'s
+  `run_migration` drives the full state machine end to end, retrying
+  every step against the complete set of known replica handles so it
+  survives a leader dying (in either shard, or the metadata group)
+  mid-migration -- exactly what a well-behaved client does when a leader
+  changes underneath it.
+- **Documented simplification:** data transfer is a repeated full-range
+  diff-and-sync (fetch source's current range contents, propose
+  `Set`/`Delete` for every difference, repeat until a pass finds none)
+  rather than tailing the source's committed log. This is less efficient
+  for large, low-churn ranges than a real CDC-style pipe would be, but it
+  is fully correct and is what makes "TRANSFERRING does the bulk copy,
+  CATCHING_UP closes the gap" a real, testable property rather than an
+  assertion. Only `storage::Value::String` values are migrated; other
+  types are skipped with a logged warning, not silently dropped without
+  a trace. The post-`Cutover` sync pass never deletes target-only keys
+  (unlike the `Transferring`/`CatchingUp` passes) since by then an
+  ASK-aware client may already be writing straight to target.
 
-**Acceptance:** section 51's resharding-related acceptance steps (13-16)
-pass.
+**Tests:** 2 unit tests (`crates/resharding/src/rpc.rs`: range filtering,
+empty range) plus 3 real integration tests
+(`crates/resharding/tests/migration.rs`) against two real 3-node shard
+Raft groups and a real 3-node metadata group: a full migration cycle
+with continuous reads/writes throughout (modeled as a real ASK-aware
+client would behave -- checking migration state before each write and
+sending it to whichever side is currently authoritative, since this
+stack has no router to do that for it), a source-leader kill mid-transfer,
+and a target-leader kill mid-catch-up, both with verified full
+convergence afterward. Building the "continuous writes" test surfaced and
+fixed a real bug in the coordinator itself (not just the test): the
+post-Cutover sync pass was deleting target-only keys, which would have
+destroyed legitimate writes an ASK-redirected client had already sent
+straight to target.
+
+**Deferred, explicitly:** Prompt.md section 51's acceptance steps 13-16
+describe continuous reads/writes *through a real RESP client* against the
+cluster during resharding. That requires the crates/server-to-real-shard
+integration already flagged as deferred in Phase 8 (there is still no
+production binary wiring the RESP/routing layer to actual shard Raft
+groups) -- this phase proves the migration mechanism itself is real and
+correct at the level the stack currently supports (direct Raft/
+coordinator access, matching how Phases 4/6/8 test Raft correctness), not
+the full section-51 scenario end to end. Recorded here rather than
+silently claimed as met.
+
+**Acceptance:** the migration state machine and data-transfer mechanism
+are real, tested, and match docs/resharding.md; the RESP-client-facing
+part of section 51's acceptance test remains gated on the
+still-unscheduled crates/server integration noted above. `cargo build/
+test --workspace` clean (120 tests total), no new clippy warnings.
 
 ## Phase 10 — Observability
 
