@@ -1,1 +1,26 @@
+# --- Rust (auto-detected) ---
+# Detected via: Cargo.toml
 target/
+**/*.rs.bk
+Cargo.lock.bak
+*.pdb
+# --- end Rust ---
+
+# --- OS (auto-detected) ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+# --- end OS ---
+
+# --- Editor (auto-detected) ---
+# Optional — many teams intentionally commit shared .vscode/launch.json or
+# .idea/ run configurations. Uncomment the lines below only if this project
+# does NOT want editor config tracked.
+# .vscode/
+# .idea/
+# --- end Editor ---
